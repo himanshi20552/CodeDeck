@@ -1,3 +1,4 @@
+from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -23,6 +24,15 @@ class Settings(BaseSettings):
     k8s_namespace: str = "deploymind"
     kubeconfig: str = ""
     docker_build_timeout: int = 1800
+    database_connect_timeout: int = Field(default=5, ge=1, le=60)
+    langfuse_public_key: str = ""
+    langfuse_secret_key: str = ""
+    langfuse_base_url: str = "https://cloud.langfuse.com"
+    langfuse_capture_content: bool = False
+    semantic_embeddings_enabled: bool = True
+    semantic_min_similarity: float = Field(default=0.35, ge=0, le=1)
+    llm_timeout_seconds: int = Field(default=45, ge=1, le=600)
+    repository_clone_timeout: int = Field(default=300, ge=10, le=1800)
 
 
 settings = Settings()

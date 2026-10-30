@@ -14,7 +14,7 @@ GitHub Repo -> Analysis -> RAG Q&A -> AI Testing -> Docker Build -> Kubernetes D
 |--------|--------------|
 | **Backend** | FastAPI, Python, PostgreSQL (SQLAlchemy), LangGraph |
 | **Frontend** | React 19, TypeScript, Vite, Tailwind CSS v4 |
-| **AI / NLP** | OpenAI, Groq, or xAI with hash-based embeddings (192-dim) and cosine similarity |
+| **AI / NLP** | OpenAI, Groq, or xAI with local semantic embeddings, BM25 and Reciprocal Rank Fusion |
 | **DevOps** | Docker, kind (Kubernetes in Docker), kubectl |
 
 ## Quick Start
@@ -72,29 +72,20 @@ GitHub Repo -> Analysis -> RAG Q&A -> AI Testing -> Docker Build -> Kubernetes D
 - [Course Alignment](docs/COURSE_ALIGNMENT.md): AI DevOps concept coverage mapped to implementation files.
 - [Future Roadmap](docs/FUTURE_ROADMAP.md): Phase-by-phase extension plan.
 
-## Benchmark Results
+## Health, tests and monitoring
 
-Results produced by `python backend/run_evaluation.py` against the standard sample FastAPI repository.
+- `/health/live` checks process liveness; `/health/ready` checks database readiness.
+- `/api/system/status` and `/api/system/integrations` report backend and optional integration status.
+- `/metrics` exposes Prometheus metrics when the dependency is installed.
+- Grafana: `http://localhost:3001`; Prometheus: `http://localhost:9090`. Configure credentials in `.env`.
+- Backend tests: `cd backend; ..\\.venv\\Scripts\\python.exe -m pytest -q` (or `pytest -q` in an activated environment).
+- Frontend production build: `cd frontend; npm ci; npm run build`.
+- Retrieval evaluation: `cd backend; ..\\.venv\\Scripts\\python.exe scripts/evaluate_retrieval.py`.
 
-| Mode | Correct / Total | Retrieval Accuracy | Answer Quality |
-|------|----------------|-------------------|----------------|
-| Heuristic (no LLM) | 4 / 5 | 80.0% | Single-line keyword answers |
-| Groq Llama-3.3-70b + RAG | 4 / 5 | 80.0% | Narrative answers with citations |
+Copy `.env.example` to `.env`. The first semantic index may download FastEmbed's BGE-small model; no hosted embeddings API is used. Set `SEMANTIC_EMBEDDINGS_ENABLED=false` for lexical-only operation or deterministic tests.
 
-> **Note on the tied accuracy score:** Both modes score 80% on the 5 factual eval questions because the heuristic
-> is tuned for exactly these fields (framework, language, port, entrypoint). The qualitative gap is visible in the
-> *answer quality* column — the LLM produces grounded, citation-backed narrative answers vs. one-line keyword responses.
-> For open-ended questions (e.g., "Explain the authentication flow"), the LLM significantly outperforms heuristic.
+## Local staging and implementation notes
 
-**Evaluation metric:** Substring match between expected label and (answer + source path) text.
-Suitable for factual fields; paraphrase-blind by design. See [`docs/PROMPT_ENGINEERING.md`](docs/PROMPT_ENGINEERING.md) for details.
+Local staging requires Docker and a reachable kind cluster. After analyzing a project, run `./scripts/stage-project.ps1 -ProjectId <id>` from PowerShell to request staging and wait for the actual rollout and smoke-test result. GitHub-hosted CI validates and builds images but does not pretend to reach a developer's local cluster.
 
-To reproduce:
-```bash
-python backend/run_evaluation.py                          # quantitative results
-python -m pytest backend/tests/test_repository_ai.py -v  # 15 unit + integration tests
-```
-
-## Architecture Notes
-
-CodeDeck employs a sequential LangGraph orchestration pipeline to guarantee deterministic progression from code analysis to deployment. It uses a bespoke hash-based embedding mechanism for source code indexing, enabling fast and localized RAG Q&A without excessive API overhead. Deployment is securely isolated within a local `kind` cluster, featuring automated readiness checks and rollout verifications.
+Read [Architecture](docs/ARCHITECTURE.md), [Hybrid Search](docs/HYBRID_SEARCH.md), [Langfuse](docs/LANGFUSE.md), [Monitoring](docs/MONITORING.md), [CI/CD](docs/CI_CD.md), and [Reliability](docs/RELIABILITY.md) for current implementation details and limitations.

@@ -7,6 +7,7 @@ from sqlalchemy import text
 
 from app.db.database import SessionLocal
 from app.services.repository_ai import get_active_ai_provider
+from app.services.observability import langfuse_status, metrics_status
 
 router = APIRouter(prefix="/api/system", tags=["system"])
 logger = logging.getLogger("deploymind")
@@ -31,13 +32,16 @@ def _cmd_ok(args: list[str], timeout: int = 8) -> tuple[bool, str]:
 
 
 def _db_ok() -> tuple[bool, str]:
+    db = None
     try:
         db = SessionLocal()
         db.execute(text("SELECT 1"))
-        db.close()
         return True, "Connected"
-    except Exception as exc:
-        return False, str(exc)[:200]
+    except Exception:
+        return False, "Database is unavailable"
+    finally:
+        if db is not None:
+            db.close()
 
 
 def _kind_clusters() -> list[str]:
@@ -84,4 +88,8 @@ def system_status():
             "message": "Available" if kubectl_ok else kubectl_msg,
         },
         "ai_provider": get_active_ai_provider(),
+        "integrations": {
+            "langfuse": langfuse_status(),
+            "prometheus": metrics_status(),
+        },
     }

@@ -236,6 +236,8 @@ def _bg_deploy_production(project_id: int):
 @router.post("/{project_id}/deploy/staging", status_code=202)
 def deploy_staging(project_id: int, background_tasks: BackgroundTasks, db: Session = Depends(get_db)):
     project = _get_project(project_id, db)
+    if project.status in {"deploying", "staging_cancel_requested"}:
+        raise HTTPException(status_code=409, detail="A staging operation is already active for this project")
     analysis = db.query(Analysis).filter(Analysis.project_id == project_id).first()
     if not analysis:
         return _fail("staging", "Run analysis before deploying")
@@ -266,6 +268,8 @@ def cancel_staging(project_id: int, db: Session = Depends(get_db)):
     project = _get_project(project_id, db)
     if project.status not in {"deploying", "staging_cancel_requested"}:
         return _fail("staging_cancel", "There is no active staging deployment to cancel")
+    if project.status == "staging_cancel_requested":
+        return {"status": "cancel_requested", "message": "Cancellation is already in progress."}
     project.status = "staging_cancel_requested"
     upsert_step(db, project_id, "Staging", "warning", result="Cancellation requested")
     db.commit()

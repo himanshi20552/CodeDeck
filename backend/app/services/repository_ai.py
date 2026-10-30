@@ -5,14 +5,12 @@ import math
 import os
 import re
 import subprocess
+import threading
+import time
 from collections import Counter
 from datetime import datetime
 from pathlib import Path
 
-try:
-    from openai import OpenAI
-except ImportError:  # pragma: no cover
-    OpenAI = None  # type: ignore
 from pydantic import BaseModel, Field
 
 from app.core.config import settings
@@ -25,11 +23,39 @@ from app.core.prompts import (
 )
 from app.services.dependency_sanitizer import sanitize_requirements_file
 from app.services.github import cleanup_repository, clone_repository
+from app.services.observability import (
+    measure_operation,
+    measured,
+    record_llm_request,
+    trace_observation,
+    update_observation,
+)
 
 logger = logging.getLogger("deploymind")
 
-INDEX_VERSION = 1
-EMBEDDING_DIMENSIONS = 192
+_openai_class = None
+_openai_import_checked = False
+_openai_import_lock = threading.Lock()
+
+
+def _get_openai_class():
+    """Load the sizeable optional SDK only on the first configured LLM request."""
+    global _openai_class, _openai_import_checked
+    if not _openai_import_checked:
+        with _openai_import_lock:
+            if not _openai_import_checked:
+                try:
+                    from openai import OpenAI as client_class
+
+                    _openai_class = client_class
+                except ImportError:
+                    _openai_class = None
+                _openai_import_checked = True
+    return _openai_class
+
+INDEX_VERSION = 2
+EMBEDDING_MODEL = "BAAI/bge-small-en-v1.5"
+LEGACY_EMBEDDING_DIMENSIONS = 192
 MAX_FILE_SIZE = 180_000
 CHUNK_SIZE = 1400
 CHUNK_OVERLAP = 220
@@ -98,6 +124,7 @@ TEST_BLOCKED_ENV = {"OPENAI_API_KEY", "GROK_API_KEY", "XAI_API_KEY", "GITHUB_TOK
 
 
 class RepositoryChunk(BaseModel):
+    chunk_id: str = ""
     path: str
     content: str
     line_start: int
@@ -111,6 +138,7 @@ class SearchResult(BaseModel):
     score: float
     line_start: int
     line_end: int
+    retrieval_method: str = "hybrid"
 
 
 class RepositoryIndexMetadata(BaseModel):
@@ -121,6 +149,9 @@ class RepositoryIndexMetadata(BaseModel):
     file_count: int
     indexed_at: str
     files: list[str] = Field(default_factory=list)
+    embedding_model: str | None = None
+    semantic_available: bool = False
+    corpus_fingerprint: str = ""
 
 
 class RepositoryAnswer(BaseModel):
@@ -128,6 +159,9 @@ class RepositoryAnswer(BaseModel):
     answer: str
     sources: list[SearchResult] = Field(default_factory=list)
     provider: str = "heuristic"
+    retrieval_method: str = "hybrid"
+    retrieval_count: int = 0
+    retrieval_latency_ms: float = 0
 
 
 class DeploymentRecommendation(BaseModel):
@@ -219,7 +253,7 @@ def _tokenize(text: str) -> list[str]:
     return re.findall(r"[a-zA-Z_][a-zA-Z0-9_./:-]{1,63}", text.lower())
 
 
-def _hash_embedding(text: str, dimensions: int = EMBEDDING_DIMENSIONS) -> list[float]:
+def _hash_embedding(text: str, dimensions: int = LEGACY_EMBEDDING_DIMENSIONS) -> list[float]:
     vec = [0.0] * dimensions
     for token, count in Counter(_tokenize(text)).items():
         idx = int(hashlib.sha256(token.encode("utf-8")).hexdigest(), 16) % dimensions
@@ -237,6 +271,7 @@ def _chunk_text(path: Path, text: str) -> list[RepositoryChunk]:
     if not lines:
         return []
 
+    normalized_path = str(path).replace("\\", "/")
     chunks: list[RepositoryChunk] = []
     start = 0
     while start < len(lines):
@@ -251,11 +286,15 @@ def _chunk_text(path: Path, text: str) -> list[RepositoryChunk]:
         if chunk_text:
             chunks.append(
                 RepositoryChunk(
-                    path=str(path).replace("\\", "/"),
+                    chunk_id=hashlib.sha256(
+                        f"{normalized_path}:{start + 1}:{end}:".encode("utf-8")
+                        + chunk_text.encode("utf-8")
+                    ).hexdigest(),
+                    path=normalized_path,
                     content=chunk_text,
                     line_start=start + 1,
                     line_end=end,
-                    embedding=_hash_embedding(chunk_text),
+                    embedding=[],
                 )
             )
 
@@ -287,10 +326,12 @@ def _load_index_payload(project_id: int) -> dict:
 
 def _save_index_payload(project_id: int, payload: dict) -> None:
     path = _index_path(project_id)
-    path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    temporary = path.with_suffix(".json.tmp")
+    temporary.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    temporary.replace(path)
 
 
-def build_repository_index(repo_path: str | Path, project_id: int, repository_url: str) -> RepositoryIndexMetadata:
+def _build_repository_index(repo_path: str | Path, project_id: int, repository_url: str) -> RepositoryIndexMetadata:
     root = Path(repo_path)
     files: list[str] = []
     chunks: list[dict] = []
@@ -305,6 +346,45 @@ def build_repository_index(repo_path: str | Path, project_id: int, repository_ur
         files.append(rel)
         chunks.extend(chunk.model_dump() for chunk in file_chunks)
 
+    semantic_available = False
+    try:
+        if not settings.semantic_embeddings_enabled:
+            raise RuntimeError("semantic embeddings disabled by configuration")
+        from fastembed import TextEmbedding
+
+        model = _get_embedding_model(TextEmbedding)
+        previous_by_id: dict[str, dict] = {}
+        index_file = _index_path(project_id)
+        if index_file.is_file():
+            try:
+                previous_payload = json.loads(index_file.read_text(encoding="utf-8"))
+                previous_meta = previous_payload.get("metadata", {})
+                if previous_meta.get("repository_url") == repository_url and previous_meta.get("embedding_model") == EMBEDDING_MODEL:
+                    previous_by_id = {
+                        old.get("chunk_id", ""): old
+                        for old in previous_payload.get("chunks", [])
+                        if old.get("chunk_id") and old.get("embedding")
+                    }
+            except (OSError, ValueError):
+                previous_by_id = {}
+        missing = []
+        for item in chunks:
+            previous = previous_by_id.get(item["chunk_id"])
+            if previous and previous.get("content") == item.get("content"):
+                item["embedding"] = previous["embedding"]
+            else:
+                missing.append(item)
+        vectors = list(model.embed([item["content"] for item in missing])) if missing else []
+        if len(vectors) == len(missing):
+            for item, vector in zip(missing, vectors):
+                item["embedding"] = [float(value) for value in vector]
+            semantic_available = all(bool(item.get("embedding")) for item in chunks)
+    except Exception as exc:
+        logger.warning("Semantic embeddings unavailable; indexing lexical BM25 only (%s)", type(exc).__name__)
+
+    fingerprint = hashlib.sha256(
+        "\n".join(f"{item['path']}:{item['chunk_id']}" for item in chunks).encode("utf-8")
+    ).hexdigest()
     metadata = RepositoryIndexMetadata(
         project_id=project_id,
         repository_url=repository_url,
@@ -312,61 +392,165 @@ def build_repository_index(repo_path: str | Path, project_id: int, repository_ur
         file_count=len(files),
         indexed_at=datetime.utcnow().isoformat() + "Z",
         files=sorted(files)[:400],
+        embedding_model=EMBEDDING_MODEL if semantic_available else None,
+        semantic_available=semantic_available,
+        corpus_fingerprint=fingerprint,
     )
     payload = {"metadata": metadata.model_dump(), "chunks": chunks}
     _save_index_payload(project_id, payload)
     return metadata
 
 
-def ensure_repository_index(project_id: int, repository_url: str) -> RepositoryIndexMetadata:
-    path = _index_path(project_id)
-    if path.is_file():
-        payload = _load_index_payload(project_id)
-        return RepositoryIndexMetadata.model_validate(payload["metadata"])
+@measured("repository_index")
+def build_repository_index(repo_path: str | Path, project_id: int, repository_url: str) -> RepositoryIndexMetadata:
+    from filelock import FileLock
 
-    temp_dir = Path(settings.workspace_dir) / f"project_{project_id}_index"
-    try:
-        clone_repository(repository_url, temp_dir)
-        return build_repository_index(temp_dir, project_id, repository_url)
-    finally:
-        cleanup_repository(temp_dir)
+    with FileLock(str(_index_path(project_id)) + ".lock", timeout=600):
+        return _build_repository_index(repo_path, project_id, repository_url)
+
+
+def ensure_repository_index(project_id: int, repository_url: str) -> RepositoryIndexMetadata:
+    from filelock import FileLock
+
+    path = _index_path(project_id)
+    with FileLock(str(path) + ".ensure.lock", timeout=600):
+        if path.is_file():
+            payload = _load_index_payload(project_id)
+            metadata = RepositoryIndexMetadata.model_validate(payload["metadata"])
+            if metadata.version == INDEX_VERSION and metadata.repository_url == repository_url:
+                return metadata
+
+        temp_dir = Path(settings.workspace_dir) / f"project_{project_id}_index"
+        try:
+            clone_repository(repository_url, temp_dir)
+            return build_repository_index(temp_dir, project_id, repository_url)
+        finally:
+            cleanup_repository(temp_dir)
 
 
 def _all_chunks(project_id: int) -> list[RepositoryChunk]:
-    payload = _load_index_payload(project_id)
+    try:
+        payload = _load_index_payload(project_id)
+    except FileNotFoundError:
+        return []
     return [RepositoryChunk.model_validate(chunk) for chunk in payload.get("chunks", [])]
+
+
+_embedding_model = None
+_embedding_lock = threading.Lock()
+
+
+def _get_embedding_model(model_class=None):
+    global _embedding_model
+    if _embedding_model is None:
+        with _embedding_lock:
+            if _embedding_model is None:
+                if model_class is None:
+                    from fastembed import TextEmbedding as model_class
+                _embedding_model = model_class(model_name=EMBEDDING_MODEL)
+    return _embedding_model
+
+
+def _bm25_rank(chunks: list[RepositoryChunk], query: str) -> list[int]:
+    """Return Okapi BM25 ranks (Robertson et al.) for exact technical terms."""
+    documents = [_tokenize(f"{chunk.path} {chunk.content}") for chunk in chunks]
+    stop_words = {
+        "what", "how", "why", "where", "which", "when", "who", "is", "are", "does", "do", "can", "could",
+        "should", "would", "will", "was", "were", "be", "been", "the", "a", "an", "in", "on", "at", "of",
+        "to", "for", "from", "with", "by", "this", "that", "these", "those", "project", "repository",
+        "application", "app", "code", "source", "file", "find", "show", "me", "tell", "about", "use", "used",
+        "using", "uses", "please",
+    }
+    query_terms = [term for term in _tokenize(query) if term not in stop_words]
+    if not documents or not query_terms:
+        return []
+    lengths = [len(document) for document in documents]
+    average_length = sum(lengths) / len(lengths) or 1.0
+    frequencies = [Counter(document) for document in documents]
+    df = Counter(term for term in set(query_terms) for counts in frequencies if counts.get(term, 0))
+    k1, b = 1.5, 0.75
+    scores = []
+    for index, counts in enumerate(frequencies):
+        score = 0.0
+        for term in query_terms:
+            frequency = counts.get(term, 0)
+            if not frequency:
+                continue
+            inverse = math.log(1 + (len(documents) - df[term] + 0.5) / (df[term] + 0.5))
+            denominator = frequency + k1 * (1 - b + b * lengths[index] / average_length)
+            score += inverse * (frequency * (k1 + 1)) / denominator
+        scores.append((score, index))
+    return [index for score, index in sorted(scores, reverse=True) if score > 0]
+
+
+def _semantic_rank(chunks: list[RepositoryChunk], query: str) -> list[int]:
+    compatible = [i for i, chunk in enumerate(chunks) if chunk.embedding]
+    if not compatible:
+        return []
+    try:
+        vector = list(_get_embedding_model().query_embed(
+            ["Represent this sentence for searching relevant passages: " + query]
+        ))[0]
+        qvector = [float(value) for value in vector]
+        scored = sorted(
+            (( _cosine(qvector, chunks[index].embedding), index) for index in compatible),
+            reverse=True,
+        )
+        return [index for score, index in scored if score >= settings.semantic_min_similarity]
+    except Exception as exc:
+        logger.warning("Semantic query embedding unavailable; using BM25 only (%s)", type(exc).__name__)
+        return []
+
+
+def _query_symbols(query: str) -> set[str]:
+    """Detect code-like identifiers and proper nouns that require exact evidence."""
+    symbols = set(re.findall(r"\b[A-Za-z][A-Za-z0-9]*(?:_[A-Za-z0-9]+)+\b", query))
+    symbols.update(re.findall(r"\b[A-Z][a-z]+[A-Z][A-Za-z0-9]*\b", query))
+    symbols.update(re.findall(r"\b[A-Z]{2,}[A-Z0-9_]*\b", query))
+    words = re.findall(r"\b[A-Z][a-zA-Z0-9]{2,}\b", query)
+    if words:
+        first_word = re.search(r"\b\w+\b", query)
+        first = first_word.group(0) if first_word else ""
+        symbols.update(word for word in words if word != first)
+        if first and first[:1].isupper() and first.lower() not in {"what", "how", "why", "where", "which", "when", "who", "is", "does", "find", "show", "explain", "can"}:
+            symbols.add(first)
+    generic = {"api", "http", "https", "url", "json", "sql", "id", "cpu", "gpu"}
+    return {symbol.lower() for symbol in symbols if symbol.lower() not in generic}
 
 
 def search_repository(project_id: int, query: str, limit: int = 4) -> list[SearchResult]:
     chunks = _all_chunks(project_id)
     if not chunks:
         return []
-    qvec = _hash_embedding(query)
-    ranked = sorted(
-        (
-            SearchResult(
-                path=chunk.path,
-                snippet=_trim_snippet(chunk.content),
-                score=round(_cosine(qvec, chunk.embedding), 4),
-                line_start=chunk.line_start,
-                line_end=chunk.line_end,
-            )
-            for chunk in chunks
-        ),
-        key=lambda item: item.score,
-        reverse=True,
-    )
-    deduped: list[SearchResult] = []
-    seen: set[tuple[str, int]] = set()
-    for item in ranked:
-        key = (item.path, item.line_start)
-        if key in seen:
+    corpus_terms = set(_tokenize(" ".join(f"{chunk.path} {chunk.content}" for chunk in chunks)))
+    if any(symbol not in corpus_terms for symbol in _query_symbols(query)):
+        return []
+    lexical = _bm25_rank(chunks, query)
+    semantic = _semantic_rank(chunks, query)
+    ranks: dict[int, float] = {}
+    for ranking in (semantic, lexical):
+        for rank, index in enumerate(ranking, start=1):
+            ranks[index] = ranks.get(index, 0.0) + 1.0 / (60 + rank)
+    method = "hybrid" if semantic and lexical else "semantic" if semantic else "bm25"
+    ranked = sorted(ranks, key=lambda index: ranks[index], reverse=True)
+    output: list[SearchResult] = []
+    seen: set[str] = set()
+    for index in ranked:
+        chunk = chunks[index]
+        if chunk.chunk_id in seen:
             continue
-        seen.add(key)
-        deduped.append(item)
-        if len(deduped) >= limit:
+        seen.add(chunk.chunk_id)
+        output.append(SearchResult(
+            path=chunk.path,
+            snippet=_trim_snippet(chunk.content),
+            score=round(ranks[index], 6),
+            line_start=chunk.line_start,
+            line_end=chunk.line_end,
+            retrieval_method=method,
+        ))
+        if len(output) >= limit:
             break
-    return deduped
+    return output
 
 
 def get_active_ai_provider() -> dict[str, str]:
@@ -390,10 +574,25 @@ def get_active_ai_provider() -> dict[str, str]:
     return {"provider": "Grounded Heuristic", "model": "rule-based-engine", "status": "offline_fallback", "message": "No usable LLM API key is configured."}
 
 
-def _safe_chat_with_provider(
+def _response_usage_details(response) -> dict[str, int] | None:
+    usage = getattr(response, "usage", None)
+    if usage is None:
+        return None
+    input_tokens = getattr(usage, "prompt_tokens", None)
+    output_tokens = getattr(usage, "completion_tokens", None)
+    if input_tokens is None or output_tokens is None:
+        return None
+    return {
+        "input": int(input_tokens),
+        "output": int(output_tokens),
+        "total": int(getattr(usage, "total_tokens", input_tokens + output_tokens)),
+    }
+
+
+def _safe_chat_with_provider_impl(
     prompt: str,
     system_prompt: str = "You are a grounded repository assistant. Answer only from provided evidence.",
-) -> tuple[str | None, str]:
+) -> tuple[str | None, str, dict[str, int] | None]:
     """Attempts completion with OpenAI first, falls back to Groq / xAI, or returns None and 'heuristic'."""
     last_failure: str | None = None
 
@@ -404,9 +603,12 @@ def _safe_chat_with_provider(
 
     # 1. Try OpenAI if key is configured and not placeholder
     openai_key = (settings.openai_api_key or "").strip()
-    if OpenAI and openai_key and not openai_key.startswith("sk-abcdef") and not openai_key.startswith("sk-dummy"):
+    openai_client_class = None
+    if openai_key and not openai_key.startswith("sk-abcdef") and not openai_key.startswith("sk-dummy"):
+        openai_client_class = _get_openai_class()
+    if openai_client_class:
         try:
-            client = OpenAI(api_key=openai_key)
+            client = openai_client_class(api_key=openai_key, timeout=settings.llm_timeout_seconds, max_retries=1)
             res = client.chat.completions.create(
                 model=getattr(settings, "openai_model", "gpt-4.1-mini"),
                 temperature=0.2,
@@ -417,10 +619,10 @@ def _safe_chat_with_provider(
             )
             text = res.choices[0].message.content if res.choices else None
             if isinstance(text, str) and text.strip():
-                return text.strip(), "OpenAI (gpt-4.1-mini)"
+                return text.strip(), "OpenAI (gpt-4.1-mini)", _response_usage_details(res)
         except Exception as e:
             last_failure = failure_label("OpenAI", e)
-            logger.warning("OpenAI completion failed (%s), attempting secondary provider fallback", e)
+            logger.warning("OpenAI completion failed (%s), attempting secondary provider fallback", type(e).__name__)
 
     # 2. Try Groq (either configured directly or through gsk_ key in grok_api_key)
     grok_key = (getattr(settings, "grok_api_key", "") or getattr(settings, "xai_api_key", "") or "").strip()
@@ -430,14 +632,18 @@ def _safe_chat_with_provider(
             groq_key = grok_key
         grok_key = ""
 
-    if OpenAI and groq_key and not groq_key.startswith("gsk-dummy"):
+    if groq_key and not groq_key.startswith("gsk-dummy"):
+        openai_client_class = openai_client_class or _get_openai_class()
+    if openai_client_class and groq_key and not groq_key.startswith("gsk-dummy"):
         configured_model = getattr(settings, "groq_model", "qwen/qwen3.8-27b")
         candidate_models = [configured_model, "qwen/qwen3.8-27b", "openai/gpt-oss-120b", "openai/gpt-oss-20b"]
         candidate_models = list(dict.fromkeys(candidate_models))
 
-        client = OpenAI(
+        client = openai_client_class(
             api_key=groq_key,
             base_url=getattr(settings, "groq_base_url", "https://api.groq.com/openai/v1"),
+            timeout=settings.llm_timeout_seconds,
+            max_retries=1,
         )
         for model in candidate_models:
             try:
@@ -451,21 +657,23 @@ def _safe_chat_with_provider(
                 )
                 text = res.choices[0].message.content if res.choices else None
                 if isinstance(text, str) and text.strip():
-                    return text.strip(), f"Groq ({model})"
+                    return text.strip(), f"Groq ({model})", _response_usage_details(res)
             except Exception as e:
                 last_failure = failure_label("Groq", e)
-                logger.warning("Groq completion failed with model %s (%s)", model, e)
+                logger.warning("Groq completion failed with model %s (%s)", model, type(e).__name__)
                 status_code = getattr(e, "status_code", None)
                 if status_code == 404:
                     continue
                 break
 
     # 3. Try xAI Grok if key is configured (or if OpenAI failed)
-    if OpenAI and grok_key and not grok_key.startswith("xai-dummy"):
+    if grok_key and not grok_key.startswith("xai-dummy"):
+        openai_client_class = openai_client_class or _get_openai_class()
+    if openai_client_class and grok_key and not grok_key.startswith("xai-dummy"):
         try:
             base_url = getattr(settings, "grok_base_url", "https://api.x.ai/v1")
             model = getattr(settings, "grok_model", "grok-2-latest")
-            client = OpenAI(api_key=grok_key, base_url=base_url)
+            client = openai_client_class(api_key=grok_key, base_url=base_url, timeout=settings.llm_timeout_seconds, max_retries=1)
             res = client.chat.completions.create(
                 model=model,
                 temperature=0.2,
@@ -476,14 +684,34 @@ def _safe_chat_with_provider(
             )
             text = res.choices[0].message.content if res.choices else None
             if isinstance(text, str) and text.strip():
-                return text.strip(), f"xAI Grok ({model})"
+                return text.strip(), f"xAI Grok ({model})", _response_usage_details(res)
         except Exception as e:
             last_failure = failure_label("xAI Grok", e)
-            logger.warning("xAI Grok completion failed (%s)", e)
+            logger.warning("xAI Grok completion failed (%s)", type(e).__name__)
 
     if last_failure:
-        return None, f"Grounded Heuristic Fallback — {last_failure}"
-    return None, "Grounded Heuristic Fallback (no provider configured)"
+        return None, f"Grounded Heuristic Fallback — {last_failure}", None
+    return None, "Grounded Heuristic Fallback (no provider configured)", None
+
+
+def _safe_chat_with_provider(
+    prompt: str,
+    system_prompt: str = "You are a grounded repository assistant. Answer only from provided evidence.",
+) -> tuple[str | None, str]:
+    started = time.perf_counter()
+    with trace_observation("llm_completion", as_type="generation") as trace:
+        answer, provider, usage_details = _safe_chat_with_provider_impl(prompt, system_prompt)
+        update_observation(
+            trace,
+            model=provider,
+            level="DEFAULT" if answer else "WARNING",
+            status_message=None if answer else "No configured provider returned a response",
+            metadata={"provider_result": provider},
+            usage_details=usage_details,
+        )
+    family = next((name for name in ("OpenAI", "Groq", "xAI") if name in provider), "none")
+    record_llm_request(family, "success" if answer else "failure", time.perf_counter() - started)
+    return answer, provider
 
 
 def _safe_chat(
@@ -598,10 +826,37 @@ def _heuristic_answer(question: str, analysis: dict, signals: dict, sources: lis
     return "I do not have enough indexed repository context to answer that confidently."
 
 
+def _ground_answer_citations(answer: str, sources: list[SearchResult]) -> str:
+    allowed = {f"{source.path}:{source.line_start}-{source.line_end}" for source in sources}
+
+    def validate(match: re.Match[str]) -> str:
+        return match.group(0) if match.group(1) in allowed else ""
+
+    answer = re.sub(r"\[([^\]\n]+:\d+-\d+)\]", validate, answer).strip()
+    if not any(f"[{citation}]" in answer for citation in allowed):
+        first = sources[0]
+        answer = f"{answer}\n\nEvidence: [{first.path}:{first.line_start}-{first.line_end}]"
+    return answer
+
+
 def answer_repository_question(project_id: int, question: str, analysis: dict) -> RepositoryAnswer:
     ensure_repository_index(project_id, analysis.get("repository_url", ""))
-    sources = search_repository(project_id, question, limit=4)
+    retrieval_started = time.perf_counter()
+    with measure_operation("repository_retrieval"):
+        sources = search_repository(project_id, question, limit=4)
+    retrieval_latency_ms = round((time.perf_counter() - retrieval_started) * 1000, 2)
     signals = _collect_signals(project_id, analysis)
+
+    if not sources:
+        return RepositoryAnswer(
+            question=question,
+            answer="I could not find relevant evidence for this question in the indexed repository, so I can’t answer it reliably.",
+            sources=[],
+            provider="insufficient repository evidence",
+            retrieval_method="none",
+            retrieval_count=0,
+            retrieval_latency_ms=retrieval_latency_ms,
+        )
 
     source_block = (
         "\n\n".join(f"[{src.path}:{src.line_start}-{src.line_end}]\n{src.snippet}" for src in sources)
@@ -610,7 +865,9 @@ def answer_repository_question(project_id: int, question: str, analysis: dict) -
     )
     system_prompt = (
         "You are DeployMind AI, an intelligent DevOps and repository technical assistant. "
-        "Provide a concise, direct, and structured answer based strictly on the detected architecture signals and code snippets. "
+        "Answer only from retrieved repository snippets. Every factual claim must cite an available source as [path:line-line]. "
+        "The architecture signals are hints only and are not evidence. If snippets do not support an answer, say so. "
+        "Never invent paths, line numbers, functions, dependencies, or settings. "
         "Format with clear bullet points and bold key terms. Keep the answer under 120 words. "
         "Do not write long rambles or unstructured text."
     )
@@ -619,14 +876,39 @@ def answer_repository_question(project_id: int, question: str, analysis: dict) -
         f"DETECTED REPOSITORY ARCHITECTURE & SIGNALS:\n{json.dumps(signals, indent=2)}\n\n"
         f"RETRIEVED CODE EVIDENCE:\n{source_block}"
     )
-    answer_text, provider = _safe_chat_with_provider(prompt, system_prompt=system_prompt)
-    if not answer_text:
-        answer_text = _heuristic_answer(question, analysis, signals, sources)
-        # Distinguish a request-time outage from an unconfigured provider. The
-        # system settings show configured keys; this label shows what answered
-        # this specific request and why it fell back.
-        provider = provider.replace("Grounded Heuristic Fallback", "Heuristic Analysis")
-    return RepositoryAnswer(question=question, answer=answer_text, sources=sources, provider=provider)
+    with trace_observation(
+        "repository_qa",
+        as_type="span",
+        metadata={
+            "project_id": project_id,
+            "retrieval_count": len(sources),
+            "retrieval_method": sources[0].retrieval_method,
+            "sources": [
+                {"path": source.path, "line_start": source.line_start, "line_end": source.line_end}
+                for source in sources
+            ],
+        },
+        input_value=question,
+    ) as trace:
+        with measure_operation("llm_generation"):
+            answer_text, provider = _safe_chat_with_provider(prompt, system_prompt=system_prompt)
+        if not answer_text:
+            answer_text = _heuristic_answer(question, analysis, signals, sources)
+            # Distinguish a request-time outage from an unconfigured provider. The
+            # system settings show configured keys; this label shows what answered
+            # this specific request and why it fell back.
+            provider = provider.replace("Grounded Heuristic Fallback", "Heuristic Analysis")
+        answer_text = _ground_answer_citations(answer_text, sources)
+        update_observation(trace, output=answer_text, metadata={"provider": provider})
+    return RepositoryAnswer(
+        question=question,
+        answer=answer_text,
+        sources=sources,
+        provider=provider,
+        retrieval_method=sources[0].retrieval_method,
+        retrieval_count=len(sources),
+        retrieval_latency_ms=retrieval_latency_ms,
+    )
 
 
 def generate_deployment_recommendation(project_id: int, analysis: dict) -> DeploymentRecommendation:
@@ -1277,6 +1559,7 @@ def _discover_python_entrypoint(repo_path: Path, framework: str) -> tuple[str | 
     return None, None
 
 
+@measured("ai_tests")
 def run_ai_generated_tests(project_id: int, repository_url: str, analysis: dict, timeout: int = 180) -> AITestRun:
     ensure_repository_index(project_id, repository_url)
     framework = (analysis.get("framework") or "").strip()

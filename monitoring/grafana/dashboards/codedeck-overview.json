@@ -1,0 +1,31 @@
+{
+  "annotations": {"list": []},
+  "editable": false,
+  "fiscalYearStartMonth": 0,
+  "graphTooltip": 0,
+  "id": null,
+  "links": [],
+  "liveNow": false,
+  "panels": [
+    {"type":"timeseries","title":"HTTP request rate","description":"Completed requests per second; metrics scrapes are excluded.","gridPos":{"h":8,"w":12,"x":0,"y":0},"targets":[{"expr":"sum by (route, method) (rate(codedeck_http_requests_total[5m]))","legendFormat":"{{method}} {{route}}","refId":"A"}],"fieldConfig":{"defaults":{"unit":"reqps"},"overrides":[]},"datasource":{"type":"prometheus","uid":"codedeck-prometheus"}},
+    {"type":"timeseries","title":"HTTP error rate","description":"5xx responses per second.","gridPos":{"h":8,"w":12,"x":12,"y":0},"targets":[{"expr":"sum(rate(codedeck_http_requests_total{status=~\"5..\"}[5m]))","legendFormat":"5xx","refId":"A"}],"fieldConfig":{"defaults":{"unit":"reqps"},"overrides":[]},"datasource":{"type":"prometheus","uid":"codedeck-prometheus"}},
+    {"type":"timeseries","title":"HTTP latency p95","description":"95th percentile request latency by route.","gridPos":{"h":8,"w":12,"x":0,"y":8},"targets":[{"expr":"histogram_quantile(0.95, sum by (le, route) (rate(codedeck_http_request_duration_seconds_bucket[5m])))","legendFormat":"{{route}}","refId":"A"}],"fieldConfig":{"defaults":{"unit":"s"},"overrides":[]},"datasource":{"type":"prometheus","uid":"codedeck-prometheus"}},
+    {"type":"timeseries","title":"Backend process memory","description":"Resident memory of the Python process.","gridPos":{"h":8,"w":12,"x":12,"y":8},"targets":[{"expr":"process_resident_memory_bytes","legendFormat":"resident memory","refId":"A"}],"fieldConfig":{"defaults":{"unit":"bytes"},"overrides":[]},"datasource":{"type":"prometheus","uid":"codedeck-prometheus"}},
+    {"type":"timeseries","title":"Operation outcomes","description":"Recorded indexing, retrieval, AI, build, deployment and smoke-test outcomes.","gridPos":{"h":8,"w":12,"x":0,"y":16},"targets":[{"expr":"sum by (operation, outcome) (rate(codedeck_operations_total[5m]))","legendFormat":"{{operation}} {{outcome}}","refId":"A"}],"fieldConfig":{"defaults":{"unit":"ops"},"overrides":[]},"datasource":{"type":"prometheus","uid":"codedeck-prometheus"}},
+    {"type":"timeseries","title":"Operation latency p95","description":"95th percentile duration for recorded operations.","gridPos":{"h":8,"w":12,"x":12,"y":16},"targets":[{"expr":"histogram_quantile(0.95, sum by (le, operation) (rate(codedeck_operation_duration_seconds_bucket[5m])))","legendFormat":"{{operation}}","refId":"A"}],"fieldConfig":{"defaults":{"unit":"s"},"overrides":[]},"datasource":{"type":"prometheus","uid":"codedeck-prometheus"}},
+    {"type":"timeseries","title":"LLM requests and latency","description":"LLM success/failure requests and request latency by provider family.","gridPos":{"h":8,"w":12,"x":0,"y":24},"targets":[{"expr":"sum by (provider, outcome) (rate(codedeck_llm_requests_total[5m]))","legendFormat":"{{provider}} {{outcome}}","refId":"A"},{"expr":"histogram_quantile(0.95, sum by (le, provider) (rate(codedeck_llm_request_duration_seconds_bucket[5m])))","legendFormat":"{{provider}} p95","refId":"B"}],"fieldConfig":{"defaults":{"unit":"s"},"overrides":[]},"datasource":{"type":"prometheus","uid":"codedeck-prometheus"}},
+    {"type":"timeseries","title":"Active long operations","description":"Currently running operations by bounded operation type.","gridPos":{"h":8,"w":12,"x":12,"y":24},"targets":[{"expr":"codedeck_active_operations","legendFormat":"{{operation}}","refId":"A"}],"fieldConfig":{"defaults":{"unit":"short"},"overrides":[]},"datasource":{"type":"prometheus","uid":"codedeck-prometheus"}},
+    {"type":"stat","title":"Backend process up","description":"Availability of the backend process metrics endpoint.","gridPos":{"h":4,"w":12,"x":0,"y":32},"targets":[{"expr":"up{job=\"codedeck-backend\"}","refId":"A"}],"fieldConfig":{"defaults":{"mappings":[{"options":{"0":{"text":"DOWN","color":"red"},"1":{"text":"UP","color":"green"}},"type":"value"}],"thresholds":{"mode":"absolute","steps":[{"color":"red","value":null},{"color":"green","value":1}]},"unit":"none"},"overrides":[]},"options":{"reduceOptions":{"calcs":["lastNotNull"],"fields":"","values":false},"orientation":"auto","textMode":"auto","colorMode":"value","graphMode":"none","justifyMode":"auto","wideLayout":true},"datasource":{"type":"prometheus","uid":"codedeck-prometheus"}},
+    {"type":"stat","title":"Backend process uptime","description":"Seconds since the Python process started, when supported by the runtime collector.","gridPos":{"h":4,"w":12,"x":12,"y":32},"targets":[{"expr":"time() - process_start_time_seconds","refId":"A"}],"fieldConfig":{"defaults":{"unit":"s"},"overrides":[]},"options":{"reduceOptions":{"calcs":["lastNotNull"],"fields":"","values":false},"orientation":"auto","textMode":"auto","colorMode":"value","graphMode":"none","justifyMode":"auto","wideLayout":true},"datasource":{"type":"prometheus","uid":"codedeck-prometheus"}}
+  ],
+  "refresh":"15s",
+  "schemaVersion":41,
+  "tags":["codedeck","application"],
+  "templating":{"list":[]},
+  "time":{"from":"now-6h","to":"now"},
+  "timepicker":{},
+  "timezone":"browser",
+  "title":"CodeDeck Overview",
+  "uid":"codedeck-overview",
+  "version":1
+}

@@ -42,7 +42,7 @@ The system orchestrates operations using a LangGraph sequential pipeline. Each n
 ```
 
 1. **Analyze**: Clones the repository, analyzes structure, and extracts metadata.
-2. **Intelligence**: Builds the semantic RAG index (chunking, hash embeddings).
+2. **Intelligence**: Builds a versioned repository index using local semantic embeddings and lexical search.
 3. **Tests**: Identifies application endpoints and generates test suites (FastAPI/Flask).
 4. **Security**: Scans for secrets, Dockerfile root-user issues, and Kubernetes privileges.
 5. **Docker**: Builds the application container image.
@@ -52,13 +52,13 @@ The system orchestrates operations using a LangGraph sequential pipeline. Each n
 
 Our Retreival-Augmented Generation pipeline powers the intelligent Q&A and analysis features:
 
-1. **File Selection**: Identifies relevant source code and documentation files.
-2. **Chunking**: Splits files into manageable context windows.
-3. **Hash Embeddings**: Generates 192-dimensional hash-based embeddings for chunks.
-4. **Cosine Search**: Computes cosine similarity between the user query and chunk embeddings.
-5. **Context Assembly**: Retrieves the highest-scoring chunks.
-6. **LLM Invocation**: Passes the context and query to OpenAI `gpt-4.1-mini`.
-7. **Answer Generation**: Returns the synthesized answer to the user.
+1. **File Selection**: Includes bounded source, configuration and documentation files while skipping dependency/build output.
+2. **Chunking**: Splits text into overlapping chunks with stable IDs, repository-relative path and line ranges.
+3. **Semantic Embeddings**: Uses local FastEmbed `BAAI/bge-small-en-v1.5` vectors when the model is available.
+4. **Lexical Search**: Ranks exact identifiers and terms with BM25 Okapi.
+5. **Fusion**: Combines semantic and BM25 ranks with Reciprocal Rank Fusion (RRF), then deduplicates stable chunk IDs.
+6. **Grounding**: Sends retrieved evidence to the configured OpenAI-compatible provider and asks for citations using actual source paths and lines. With no evidence it returns an insufficient-context response.
+7. **Fallback**: If semantic embeddings cannot be loaded, it reports and uses BM25-only retrieval; it does not claim semantic or hybrid retrieval is active.
 
 ## Deployment Pipeline Detail
 
@@ -120,7 +120,7 @@ The architecture is designed for extensibility:
 | **React & Vite** | Fast build times, robust ecosystem, and modular component design. |
 | **LangGraph** | Provides a resilient, stateful workflow execution engine for complex pipelines. |
 | **Kind** | Lightweight, local Kubernetes testing without cloud infrastructure costs. |
-| **Hash Embeddings** | Deterministic, fast, and completely local embedding generation for source code. |
+| **FastEmbed + BM25** | Local dense semantic search catches paraphrases; BM25 preserves exact symbol and configuration matching. |
 
 ## Current vs. Future Scope
 
@@ -134,3 +134,7 @@ The architecture is designed for extensibility:
 - Advanced static application security testing (SAST).
 - Full CI/CD integration with GitHub Actions / GitLab CI.
 - Multi-user collaboration features.
+
+## Current observability additions
+
+The FastAPI process exposes liveness/readiness routes and Prometheus metrics. Compose's optional `observability` profile starts Prometheus and Grafana with provisioned configuration. Langfuse tracing is an optional server-side SDK integration with content capture off by default. These components do not include node-exporter, cAdvisor or kube-state-metrics, so they do not report host, Docker or Kubernetes resource telemetry. See [Monitoring](MONITORING.md), [Langfuse](LANGFUSE.md), [Hybrid Search](HYBRID_SEARCH.md), [CI/CD](CI_CD.md) and [Reliability](RELIABILITY.md).

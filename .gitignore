@@ -26,4 +26,13 @@ k8s/generated/*
 !k8s/generated/.gitkeep
 generated_tests/
 
-docs/
+!docs/
+docs/*
+!docs/README.md
+!docs/HYBRID_SEARCH.md
+!docs/LANGFUSE.md
+!docs/MONITORING.md
+!docs/CI_CD.md
+!docs/RELIABILITY.md
+!docs/ARCHITECTURE.md
+!docs/AI_PIPELINE.md

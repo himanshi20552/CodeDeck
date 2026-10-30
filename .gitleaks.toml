@@ -1,0 +1,8 @@
+[allowlist]
+description = "Unit tests contain deliberately fake provider-key examples."
+regexes = [
+  '''sk-abcdefghijklmnopqrstuvwxyz123456''',
+  '''xai-test-key-12345''',
+  '''gsk_test_key_12345''',
+  '''sk-live-test-key-999''',
+]

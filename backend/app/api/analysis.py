@@ -45,6 +45,8 @@ def _fail(step: str, message: str, details: str | None = None, status_code: int 
 @router.post("/{project_id}/analyze", response_model=AnalysisOut)
 def start_analysis(project_id: int, db: Session = Depends(get_db)):
     project = _get_project(project_id, db)
+    if project.status in {"analyzing", "deploying", "staging_cancel_requested"}:
+        raise HTTPException(status_code=409, detail="An analysis or deployment operation is already active for this project")
     logger.info("analysis started for project %s", project_id)
 
     final = run_analysis_workflow(project_id, project.repository_url, project.repository_name)

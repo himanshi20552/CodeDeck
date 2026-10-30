@@ -10,6 +10,7 @@ from pathlib import Path
 from collections.abc import Callable
 
 from app.core.config import settings
+from app.services.observability import measured
 from app.services.deployment_control import DeploymentCancelled
 
 logger = logging.getLogger("deploymind")
@@ -130,6 +131,7 @@ def _stop_subprocess(process: subprocess.Popen) -> None:
         process.wait(timeout=5)
 
 
+@measured("docker_build")
 def build_image(
     context_dir: Path,
     dockerfile: Path,

@@ -38,28 +38,26 @@ To provide the LLM with relevant context from the repository, CodeDeck builds a 
 
 1.  **File Selection:** The system filters out non-text files, binaries, and ignored directories (e.g., `node_modules`, `.git`, `.venv`) to ensure only relevant source code and documentation are processed.
 2.  **Chunking:** Files are divided into smaller segments. CodeDeck uses a chunk size of approximately 1400 characters with an overlap of 220 characters. The overlap ensures that context isn't lost if an important function or thought spans across a chunk boundary.
-3.  **Vectorization (Hashing):**
-    *   *Implementation Note:* CodeDeck currently implements a lightweight, dependency-free embedding strategy. It uses term-frequency hashing based on SHA-256 mapped to a 192-dimensional vector.
-    *   *Honesty Declaration:* This is a deterministic frequency hash, not a dense semantic embedding model (like those produced by transformers). It excels at exact keyword overlap but does not understand abstract semantic similarity (e.g., it won't inherently know that "create" and "build" are related).
-4.  **Storage:** The chunks and their corresponding vector representations are stored locally in a `repo_index.json` file.
+3.  **Vectorization:** When enabled, CodeDeck uses FastEmbed with the local `BAAI/bge-small-en-v1.5` model (384-dimensional dense vectors). It downloads the model on first use and runs inference locally. If it is unavailable, the index remains usable with BM25 lexical search and marks semantic retrieval unavailable.
+4.  **Stable metadata:** Chunks have stable content/path/line-derived IDs, repository-relative paths, source line ranges, a corpus fingerprint and index version. Per-project indexes are atomically persisted under `WORKSPACE_DIR/generated/project_<id>/repository_index.json`.
 
 ## 3. Semantic Retrieval
 
 When a user asks a question or a process requires context, CodeDeck searches the generated index.
 
-*   The user's query is vectorized using the same SHA-256 hashing mechanism.
-*   The system performs a Cosine Similarity Search, comparing the query vector against all chunk vectors in the index.
-*   The Top-K most similar chunks (highest cosine similarity scores) are retrieved.
+*   The question is embedded with the same local model as the repository chunks when vectors are available.
+*   A genuine Okapi BM25 ranker independently finds exact symbols, package names, configuration keys and code terms.
+*   Reciprocal Rank Fusion combines the semantic and lexical ranks, and stable chunk IDs prevent duplicate context. Semantic candidates below `SEMANTIC_MIN_SIMILARITY` are excluded.
 
 ## 4. AI Q&A Workflow
 
 The RAG workflow answers user queries contextually.
 
-1.  **Context Retrieval:** Relevant chunks are fetched via semantic search.
+1.  **Context Retrieval:** Relevant chunks are fetched through the reported hybrid, semantic-only or BM25-only path.
 2.  **Prompt Assembly:** The system constructs a strict prompt (referencing strategies defined in `prompts.py`). It injects the user's question and the retrieved codebase chunks.
-3.  **LLM Execution:** The prompt is sent to `gpt-4o-mini` (or similar configured model).
-4.  **Grounding:** The prompt strictly instructs the LLM to base its answer *only* on the provided context and to cite its sources.
-5.  **Fallback Mechanism:** If the OpenAI API key is unavailable, the system gracefully falls back to deterministic heuristic responses based on the initial analysis step, ensuring the platform remains functional offline.
+3.  **LLM Execution:** CodeDeck tries the configured OpenAI-compatible provider chain (OpenAI, Groq, xAI) with a bounded timeout and one SDK retry.
+4.  **Grounding:** The prompt requires facts to cite retrieved file paths and line ranges. Citations are checked against the returned evidence; unsupported paths/line numbers are removed.
+5.  **Fallback Mechanism:** If no provider is configured or all attempts fail, CodeDeck produces a labeled grounded heuristic answer only when retrieved evidence exists. With no relevant evidence it returns an explicit insufficient-context response without calling an LLM.
 
 ## 5. Deployment Recommendation
 
@@ -91,12 +89,10 @@ When an infrastructure task fails, AI accelerates the debugging process.
 
 To ensure the reliability of the RAG pipeline, CodeDeck includes a built-in evaluation protocol.
 
-*   The system defines a standard set of 5 evaluation questions (e.g., "What are the core dependencies?", "What port does the application use?").
-*   These questions are run automatically against the generated index.
-*   The quality of the retrieved chunks (relevance) and the final LLM answers are evaluated to track pipeline performance and tune chunking/hashing parameters.
+*   The built-in project evaluation checks common repository questions against indexed evidence.
+*   `backend/scripts/evaluate_retrieval.py` compares the legacy hash baseline, BM25, semantic and RRF hybrid rankers on a checked-in fixture and reports Recall@3, HitRate@3, MRR@3 and measured latency.
+*   The fixture metrics are small regression checks, not a claim of general answer quality. See [Hybrid Search](HYBRID_SEARCH.md) for the actual latest recorded run and limitations.
 
 ## Future Extension Points
 
-*   **Dense Semantic Embeddings:** Migrating from the current SHA-256 frequency hashing to a dedicated local embedding model (e.g., via `sentence-transformers`) to enable true semantic understanding.
-*   **Hybrid Search:** Implementing BM25 keyword search alongside dense vector search.
 *   **Agentic Workflows:** Allowing the AI not just to recommend fixes, but to execute code edits and retry failed deployments autonomously.

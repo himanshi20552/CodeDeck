@@ -1,0 +1,7 @@
+[
+  {"question":"Which framework serves the API?","expected_path":"README.md"},
+  {"question":"Find the exact calculate_invoice_total function","expected_path":"app.py"},
+  {"question":"Which environment variable configures the database connection?","expected_path":"settings.py"},
+  {"question":"What readiness endpoint is defined?","expected_path":"app.py"},
+  {"question":"Is Redis configured in this repository?","expected_path":null}
+]

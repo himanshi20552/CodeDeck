@@ -191,6 +191,8 @@ export default function App() {
   const [loadingEval, setLoadingEval] = useState(false)
   const [error, setError] = useState<string | null>(null)
   const [logs, setLogs] = useState<Array<{ tag: string; text: string; ts: string }>>([])
+  const selectedProjectId = useRef<number | null>(null)
+  const pollStartedAt = useRef<Record<number, number>>({})
 
   const log = (tag: string, text: string) =>
     setLogs(p => [...p.slice(-500), { tag, text, ts: new Date().toLocaleTimeString() }])
@@ -202,13 +204,32 @@ export default function App() {
     getSystemStatus().then(setSystemStatus).catch(() => setSystemStatus(null))
   }, [])
 
-  // Poll while busy
+  // Poll serially while a server-side operation is active. Stop after 30 minutes.
   useEffect(() => {
     if (!selected) return
     const isBusy = selected.status === 'deploying' || selected.status === 'staging_cancel_requested' || selected.status === 'deploying_green' || selected.status === 'analyzing'
-    if (!isBusy) return
-    const iv = setInterval(() => loadProject(selected).catch(() => undefined), 3000)
-    return () => clearInterval(iv)
+    if (!isBusy) {
+      delete pollStartedAt.current[selected.id]
+      return
+    }
+    pollStartedAt.current[selected.id] ??= Date.now()
+    let stopped = false
+    let timer: ReturnType<typeof setTimeout>
+    const poll = async () => {
+      if (stopped) return
+      if (Date.now() - pollStartedAt.current[selected.id] > 30 * 60 * 1000) {
+        setError('This operation is still running after 30 minutes. Polling stopped; refresh the project to check its latest state.')
+        return
+      }
+      try {
+        await loadProject(selected)
+      } catch (err) {
+        setError(`Could not refresh operation status: ${String((err as Error).message || err)}`)
+      }
+      if (!stopped) timer = setTimeout(poll, 3000)
+    }
+    timer = setTimeout(poll, 3000)
+    return () => { stopped = true; clearTimeout(timer) }
   }, [selected?.id, selected?.status])
 
   // Sync sub-results from analysis_result
@@ -221,6 +242,7 @@ export default function App() {
 
   async function loadProject(project: Project, isManual = false) {
     if (isManual) setError(null)
+    selectedProjectId.current = project.id
     setSelected(project)
     const [a, steps, fresh, generated, deps] = await Promise.all([
       getAnalysis(project.id),
@@ -229,6 +251,7 @@ export default function App() {
       getFiles(project.id),
       listDeployments(project.id),
     ])
+    if (selectedProjectId.current !== project.id) return
     setAnalysis(a)
     setPipeline(steps)
     setSelected(fresh)
@@ -248,6 +271,7 @@ export default function App() {
     log('Analysis', `Starting analysis for ${url}`)
     try {
       const project = await createProject(url.trim())
+      selectedProjectId.current = project.id
       setSelected(project)
       setProjects(prev => [project, ...prev.filter(p => p.id !== project.id)])
       log('Analysis', 'Repository cloned — running pipeline…')
@@ -766,6 +790,9 @@ export default function App() {
                                 Engine: {qaResult.provider}
                               </span>
                             )}
+                          </div>
+                          <div className="mb-3 text-[10px] text-zinc-500">
+                            Retrieval: {qaResult.retrieval_method ?? 'unknown'} · {qaResult.retrieval_count ?? qaResult.sources.length} sources · {qaResult.retrieval_latency_ms == null ? 'latency unavailable' : `${qaResult.retrieval_latency_ms.toFixed(1)} ms`}
                           </div>
                           <FormattedText text={qaResult.answer} />
                         </div>
@@ -1483,8 +1510,17 @@ export default function App() {
                 </div>
                 <div className="flex items-center justify-between">
                   <span className="text-zinc-400">RAG Vector Index</span>
-                  <span className="font-mono text-zinc-400">192-dim Normalized Cosine Retrieval</span>
+                  <span className="font-mono text-zinc-400">Local semantic vectors + BM25 · RRF fusion</span>
                 </div>
+                {(['langfuse', 'prometheus'] as const).map(name => {
+                  const status = systemStatus?.integrations?.[name]
+                  return <div key={name} className="flex items-center justify-between gap-3">
+                    <span className="text-zinc-400">{name === 'langfuse' ? 'Langfuse tracing' : 'Prometheus metrics'}</span>
+                    <span className={`font-mono ${status?.status === 'available' ? 'text-emerald-400' : status?.status === 'disabled' ? 'text-zinc-500' : 'text-amber-400'}`}>
+                      {status?.status ?? 'unavailable'}
+                    </span>
+                  </div>
+                })}
                 <div className="pt-2 border-t border-zinc-800/80 text-zinc-500 leading-relaxed text-[11px]">
                   {systemStatus?.ai_provider?.message ?? 'DeployMind prioritizes OpenAI, then Groq or xAI depending on the configured key. Every answer remains grounded in retrieved repository files; heuristics are used only when no provider is configured or all providers are unavailable.'}
                 </div>

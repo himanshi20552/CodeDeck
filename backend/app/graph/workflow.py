@@ -35,6 +35,7 @@ from app.graph.state import DeployMindState
 from app.services.github import cleanup_repository, clone_repository
 from app.services.deployment_contract import build_deployment_contract
 from app.services.pipeline import upsert_step
+from app.services.observability import measured
 from app.services.repository_ai import (
     build_repository_index,
     evaluate_repository_index,
@@ -377,6 +378,7 @@ def build_workflow():
 workflow = build_workflow()
 
 
+@measured("analysis")
 def run_analysis_workflow(project_id: int, repository_url: str, repository_name: str = "") -> DeployMindState:
     dest = Path(settings.workspace_dir) / f"project_{project_id}"
     try:

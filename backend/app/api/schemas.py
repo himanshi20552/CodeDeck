@@ -1,10 +1,10 @@
 from datetime import datetime
 
-from pydantic import BaseModel
+from pydantic import BaseModel, Field, field_validator
 
 
 class ProjectCreate(BaseModel):
-    repository_url: str
+    repository_url: str = Field(min_length=8, max_length=2048)
 
 
 class ProjectOut(BaseModel):
@@ -70,7 +70,15 @@ class ErrorResponse(BaseModel):
 
 
 class QuestionRequest(BaseModel):
-    question: str
+    question: str = Field(min_length=3, max_length=2000)
+
+    @field_validator("question")
+    @classmethod
+    def question_must_not_be_blank(cls, value: str) -> str:
+        value = value.strip()
+        if not value:
+            raise ValueError("Question must not be blank")
+        return value
 
 
 class SearchSourceOut(BaseModel):
@@ -86,6 +94,9 @@ class RepositoryAnswerOut(BaseModel):
     answer: str
     sources: list[SearchSourceOut]
     provider: str | None = None
+    retrieval_method: str = "unknown"
+    retrieval_count: int = 0
+    retrieval_latency_ms: float = 0
 
 
 class EvaluationItemOut(BaseModel):

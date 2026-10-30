@@ -67,6 +67,9 @@ export type RepositoryAnswer = {
   answer: string;
   sources: SearchSource[];
   provider?: string;
+  retrieval_method?: string;
+  retrieval_count?: number;
+  retrieval_latency_ms?: number;
 };
 
 export type EvaluationItem = {
@@ -126,6 +129,7 @@ export type SystemStatus = {
   kind: { ok: boolean; available: boolean; clusters: string[]; message: string };
   kubectl: { ok: boolean; message: string };
   ai_provider?: { provider: string; model: string; status: string; message?: string };
+  integrations?: Record<string, { status: string; message: string }>;
 };
 
 export const getHealth = () => request<{ status: string; service: string }>('/health');

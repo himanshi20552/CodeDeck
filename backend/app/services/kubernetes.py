@@ -14,6 +14,7 @@ import httpx
 
 from app.core.config import settings
 from app.services.deployment_control import DeploymentCancelled
+from app.services.observability import measured
 
 logger = logging.getLogger("deploymind")
 
@@ -114,6 +115,7 @@ def apply_manifests(files: dict[str, str], namespace: str) -> None:
             logger.info("applied %s", name)
 
 
+@measured("kubernetes_rollout")
 def wait_rollout(
     deployment: str,
     namespace: str,
@@ -330,6 +332,7 @@ class PortForwardManager:
 
 port_forward_manager = PortForwardManager()
 
+@measured("smoke_test")
 def smoke_test(
     service: str,
     namespace: str,

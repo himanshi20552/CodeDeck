@@ -5,6 +5,7 @@ import signal
 import subprocess
 import threading
 import time
+import shutil
 from collections import deque
 from pathlib import Path
 from collections.abc import Callable
@@ -15,6 +16,94 @@ from app.services.observability import measured
 from app.services.deployment_control import DeploymentCancelled
 
 logger = logging.getLogger("deploymind")
+
+
+def _docker_cli() -> str:
+    """Resolve one Docker CLI binary for the worker's entire build invocation."""
+    configured = os.environ.get("CODEDECK_DOCKER_CLI")
+    if configured:
+        candidate = Path(configured)
+        if candidate.is_file():
+            return str(candidate)
+        raise RuntimeError("CODEDECK_DOCKER_CLI does not point to a Docker CLI executable")
+    # systemd often provides a shorter PATH than an interactive login shell.
+    # Prefer Ubuntu's packaged CLI when present, then resolve the active PATH.
+    if os.name != "nt" and Path("/usr/bin/docker").is_file():
+        return "/usr/bin/docker"
+    executable = shutil.which("docker")
+    if executable:
+        return executable
+    raise RuntimeError("Docker CLI not found; install Docker or set CODEDECK_DOCKER_CLI")
+
+
+def _docker_env() -> dict[str, str]:
+    """Build a safe Docker CLI environment for the selected deployment target."""
+    env = os.environ.copy()
+    env["DOCKER_BUILDKIT"] = "1"
+    env["BUILDKIT_PROGRESS"] = "plain"
+    if deployment_target() in {"remote", "k3s"} and not env.get("DOCKER_CONFIG"):
+        # Avoid Docker falling back to a user's home directory hidden by
+        # systemd ProtectHome. The directory contains no credentials by default.
+        config_dir = Path(settings.workspace_dir).resolve().parent / "docker-config"
+        try:
+            config_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+            if os.name != "nt":
+                config_dir.chmod(0o700)
+        except OSError as exc:
+            raise RuntimeError("Could not create the private remote Docker config directory") from exc
+        env["DOCKER_CONFIG"] = str(config_dir)
+    return env
+
+
+def _log_docker_cli_diagnostics(executable: str, env: dict[str, str]) -> None:
+    """Record CLI/plugin/context identity without reading or printing auth config."""
+    checks = (
+        ("client-version", [executable, "--version"]),
+        ("buildx-version", [executable, "buildx", "version"]),
+        ("context", [executable, "context", "show"]),
+    )
+    for name, command in checks:
+        try:
+            proc = subprocess.run(command, capture_output=True, text=True, timeout=10, env=env)
+            detail = (proc.stdout or proc.stderr or "").strip().replace("\n", " ")[-500:]
+            logger.info("Docker CLI diagnostic %s (exit=%s): %s", name, proc.returncode, detail)
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            logger.warning("Docker CLI diagnostic %s failed (%s)", name, type(exc).__name__)
+
+
+_IMAGE_COMPONENT = re.compile(r"^[a-z0-9]+(?:[._-][a-z0-9]+)*$")
+_IMAGE_TAG = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}$")
+
+
+def _validate_image_reference(image: str) -> None:
+    """Validate a Docker name:tag reference before invoking an external CLI."""
+    if not isinstance(image, str) or not image or len(image) > 255 or "@" in image:
+        raise ValueError("Invalid Docker image reference")
+    name, separator, tag = image.rpartition(":")
+    if not separator:
+        name = image
+    # A colon before a slash is part of a registry port, not the tag.
+    if separator and "/" in tag:
+        name, tag, separator = image, "", ""
+    if separator and not _IMAGE_TAG.fullmatch(tag):
+        raise ValueError("Invalid Docker image tag")
+    if not name or name.startswith("/") or name.endswith("/"):
+        raise ValueError("Invalid Docker image name")
+    parts = name.split("/")
+    for index, part in enumerate(parts):
+        if index == 0 and (":" in part or part == "localhost" or ("." in part and part not in {".", ".."})):
+            host, colon, port = part.partition(":")
+            labels = host.split(".")
+            valid_host = all(
+                label and label[0].isalnum() and label[-1].isalnum()
+                and all(char.isalnum() or char == "-" for char in label)
+                for label in labels
+            )
+            if not valid_host or (colon and (not port.isdigit() or not 1 <= int(port) <= 65535)):
+                raise ValueError("Invalid Docker registry in image reference")
+            continue
+        if not _IMAGE_COMPONENT.fullmatch(part):
+            raise ValueError("Invalid Docker image name")
 
 # Patterns that indicate a Dockerfile requires BuildKit (--mount) or complex
 # multi-stage tooling (bun, uv sync --frozen, etc.) that won't work with the
@@ -78,10 +167,10 @@ def run_cmd(
     timeout: int = 600,
     cancel_check: Callable[[], bool] | None = None,
 ) -> subprocess.CompletedProcess[str]:
+    if args and args[0] == "docker":
+        args = [_docker_cli(), *args[1:]]
     logger.info("running: %s", " ".join(args))
-    env = os.environ.copy()
-    env["DOCKER_BUILDKIT"] = "1"
-    env["BUILDKIT_PROGRESS"] = "plain"
+    env = _docker_env()
     if not cancel_check:
         return subprocess.run(args, cwd=cwd, capture_output=True, text=True, timeout=timeout, env=env)
 
@@ -147,6 +236,9 @@ def build_image(
         raise RuntimeError(f"Build context directory not found: {context_dir}")
     if not dockerfile.is_file():
         raise RuntimeError(f"Dockerfile not found: {dockerfile}")
+    if not dockerfile.resolve().is_relative_to(context_dir.resolve()):
+        raise ValueError("Dockerfile must be inside the build context")
+    _validate_image_reference(image)
 
     logger.info(
         "Docker build starting for image '%s' (context='%s', dockerfile='%s', timeout=%ds)",
@@ -156,11 +248,16 @@ def build_image(
         effective_timeout,
     )
 
-    args = ["docker", "build", "-t", image, "-f", str(dockerfile), str(context_dir)]
+    executable = _docker_cli()
+    args = [executable, "build", "-t", image, "-f", str(dockerfile), str(context_dir)]
+    logger.info("Docker executable: %s", executable)
+    logger.info("Docker build arguments: %r", args)
+    env = _docker_env()
+    logger.info("Docker environment: HOME=%s DOCKER_CONFIG=%s DOCKER_HOST_set=%s PATH=%s",
+                env.get("HOME", ""), env.get("DOCKER_CONFIG", ""),
+                bool(env.get("DOCKER_HOST")), env.get("PATH", ""))
+    _log_docker_cli_diagnostics(executable, env)
     try:
-        env = os.environ.copy()
-        env["DOCKER_BUILDKIT"] = "1"
-        env["BUILDKIT_PROGRESS"] = "plain"
         # Drain Docker output while the build runs. Waiting until after poll()
         # to read PIPEs can fill the OS pipe buffer and block docker build
         # forever, which also prevents staging cancellation from completing.
@@ -243,6 +340,15 @@ def build_image(
         msg = f"Docker build failed:\n{detail}"
         logger.error("Docker build failed for %s:\n%s", image, detail)
         raise RuntimeError(msg)
+
+    inspect_args = [executable, "image", "inspect", image]
+    try:
+        inspected = subprocess.run(inspect_args, capture_output=True, text=True, timeout=30, env=env)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise RuntimeError(f"Docker build completed but image verification failed: {type(exc).__name__}") from exc
+    if inspected.returncode != 0:
+        detail = ((inspected.stderr or inspected.stdout or "image inspect failed").strip())[-1000:]
+        raise RuntimeError(f"Docker build completed but image '{image}' is unavailable: {detail}")
 
     logger.info("Docker image built successfully: %s", image)
     return image
@@ -335,6 +441,9 @@ def _k3s_load_image(image: str, cancel_check: Callable[[], bool] | None = None) 
 
     if not shutil_which("k3s"):
         raise RuntimeError("K3s CLI is required on the remote deployment worker")
+    inspect = run_cmd([_docker_cli(), "image", "inspect", image], timeout=30, cancel_check=cancel_check)
+    if inspect.returncode:
+        raise RuntimeError(f"Docker image is not available for K3s import: {image}")
     with tempfile.TemporaryDirectory(prefix="codedeck-image-") as directory:
         archive = Path(directory) / "image.tar"
         try:
@@ -345,6 +454,14 @@ def _k3s_load_image(image: str, cancel_check: Callable[[], bool] | None = None) 
             proc = run_cmd([*ctr, "--namespace", "k8s.io", "images", "import", str(archive)], timeout=300, cancel_check=cancel_check)
             if proc.returncode:
                 raise RuntimeError((proc.stderr or proc.stdout or "K3s image import failed")[-2000:])
+            listed = run_cmd([*ctr, "--namespace", "k8s.io", "images", "list", "-q"], timeout=30, cancel_check=cancel_check)
+            if listed.returncode:
+                raise RuntimeError((listed.stderr or listed.stdout or "Could not verify K3s image import")[-2000:])
+            candidates = {image, f"docker.io/{image}"}
+            if "/" not in image.split(":", 1)[0]:
+                candidates.add(f"docker.io/library/{image}")
+            if not candidates.intersection(set((listed.stdout or "").splitlines())):
+                raise RuntimeError(f"K3s import completed but image '{image}' is not visible in containerd namespace k8s.io")
         except FileNotFoundError as exc:
             raise RuntimeError("Docker and K3s CLIs must be installed on the worker") from exc
     logger.info("Docker image imported into K3s containerd: %s", image)

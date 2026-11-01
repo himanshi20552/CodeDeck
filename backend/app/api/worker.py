@@ -46,6 +46,45 @@ def _redact(message: str) -> str:
     return message[:1000]
 
 
+def _fail_stale_worker_job(db: Session, heartbeat_row: WorkerHeartbeat | None) -> None:
+    """Release a persisted active job after its worker heartbeat has gone stale."""
+    if heartbeat_row is None:
+        return
+    active_job_id = (heartbeat_row.details or {}).get("active_job_id")
+    if not active_job_id:
+        return
+    last_seen = heartbeat_row.last_seen
+    if last_seen is None:
+        stale = True
+    else:
+        if last_seen.tzinfo is None:
+            last_seen = last_seen.replace(tzinfo=timezone.utc)
+        stale_after = max(settings.worker_heartbeat_interval * 3, 60)
+        stale = (datetime.now(timezone.utc) - last_seen).total_seconds() > stale_after
+    if not stale:
+        return
+    try:
+        interrupted = db.get(Deployment, int(active_job_id))
+    except (TypeError, ValueError):
+        interrupted = None
+    if interrupted and interrupted.status not in {"SUCCEEDED", "FAILED", "CANCELLED"}:
+        reason = "Worker heartbeat expired while this deployment was active; retry the deployment."
+        details = dict(interrupted.details or {})
+        details.pop("worker_payload", None)
+        details["failure_reason"] = reason
+        details["completed_at"] = datetime.now(timezone.utc).isoformat()
+        interrupted.details = details
+        interrupted.status = "FAILED"
+        project = db.get(Project, interrupted.project_id)
+        if project and interrupted.deployment_type == "remote_staging":
+            project.status = "staging_failed"
+        step_name = "Cleanup" if interrupted.deployment_type == "remote_cleanup" else "Staging"
+        upsert_step(db, interrupted.project_id, step_name, "failed", error=reason)
+    heartbeat_details = dict(heartbeat_row.details or {})
+    heartbeat_details.pop("active_job_id", None)
+    heartbeat_row.details = heartbeat_details
+
+
 @router.post("/heartbeat", dependencies=[Depends(_authenticate)])
 def heartbeat(payload: Heartbeat, db: Session = Depends(get_db)):
     row = db.get(WorkerHeartbeat, payload.worker_id)
@@ -64,9 +103,10 @@ def heartbeat(payload: Heartbeat, db: Session = Depends(get_db)):
                 interrupted.details = details
                 interrupted.status = "FAILED"
                 project = db.get(Project, interrupted.project_id)
-                if project:
+                if project and interrupted.deployment_type == "remote_staging":
                     project.status = "staging_failed"
-                upsert_step(db, interrupted.project_id, "Staging", "failed", error=details["failure_reason"])
+                step_name = "Cleanup" if interrupted.deployment_type == "remote_cleanup" else "Staging"
+                upsert_step(db, interrupted.project_id, step_name, "failed", error=details["failure_reason"])
         row.last_seen = datetime.now(timezone.utc)
         row.details = payload.details
     db.commit()
@@ -75,6 +115,8 @@ def heartbeat(payload: Heartbeat, db: Session = Depends(get_db)):
 
 @router.post("/jobs/claim", dependencies=[Depends(_authenticate)])
 def claim_job(db: Session = Depends(get_db)):
+    heartbeat_row = db.get(WorkerHeartbeat, settings.worker_id)
+    _fail_stale_worker_job(db, heartbeat_row)
     active_count = db.scalar(
         select(func.count(Deployment.id)).where(
             Deployment.deployment_type.in_(["remote_staging", "remote_cleanup"]),
@@ -106,11 +148,14 @@ def claim_job(db: Session = Depends(get_db)):
     details["started_at"] = datetime.now(timezone.utc).isoformat()
     details.setdefault("logs", []).append({"time": details["started_at"], "message": "Claimed by remote worker"})
     row.details = details
-    heartbeat_row = db.get(WorkerHeartbeat, settings.worker_id)
+    heartbeat_details = dict(heartbeat_row.details or {}) if heartbeat_row else {}
+    heartbeat_details["active_job_id"] = row.id
     if heartbeat_row:
-        heartbeat_details = dict(heartbeat_row.details or {})
-        heartbeat_details["active_job_id"] = row.id
         heartbeat_row.details = heartbeat_details
+    else:
+        # A claim can race the first heartbeat after service startup. Persist
+        # the active job here so a worker crash is still recoverable.
+        db.add(WorkerHeartbeat(worker_id=settings.worker_id, details=heartbeat_details))
     project = db.get(Project, row.project_id)
     if project:
         project.status = "deploying"

@@ -31,11 +31,13 @@ def prepare_kubeconfig() -> str | None:
     """Make kubectl work from inside the backend container against a local kind cluster."""
     if deployment_target() in {"remote", "k3s"}:
         configured = Path(settings.kubeconfig) if settings.kubeconfig else Path("/etc/rancher/k3s/k3s.yaml")
-        if configured.is_file():
-            settings.kubeconfig = str(configured)
-            os.environ["KUBECONFIG"] = str(configured)
-            return str(configured)
-        return None
+        if not configured.is_file():
+            raise RuntimeError(f"Remote Kubernetes kubeconfig not found: {configured}")
+        if not os.access(configured, os.R_OK):
+            raise RuntimeError(f"Remote Kubernetes kubeconfig is not readable by the worker: {configured}")
+        settings.kubeconfig = str(configured)
+        os.environ["KUBECONFIG"] = str(configured)
+        return str(configured)
     cluster = settings.kind_cluster_name
     out = Path(settings.workspace_dir) / "kubeconfig"
     out.parent.mkdir(parents=True, exist_ok=True)

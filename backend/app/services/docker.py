@@ -435,36 +435,124 @@ def kind_load_image(
         raise RuntimeError(msg) from exc
 
 
-def _k3s_load_image(image: str, cancel_check: Callable[[], bool] | None = None) -> None:
-    """Transfer a Docker-built image into K3s' separate containerd image store."""
+
+def _k3s_load_image(
+    image: str,
+    cancel_check: Callable[[], bool] | None = None,
+) -> None:
+    """Transfer a Docker-built image into K3s containerd."""
+
     import tempfile
 
-    if not shutil_which("k3s"):
-        raise RuntimeError("K3s CLI is required on the remote deployment worker")
-    inspect = run_cmd([_docker_cli(), "image", "inspect", image], timeout=30, cancel_check=cancel_check)
+    wrapper = "/usr/local/sbin/codedeck-k3s-ctr"
+    k3s_cli = "/usr/local/bin/k3s"
+
+    # Select the restricted wrapper for remote EC2 deployments.
+    if settings.k3s_ctr_use_sudo:
+        if not Path(wrapper).is_file():
+            raise RuntimeError(
+                f"Restricted K3s wrapper not found: {wrapper}"
+            )
+
+        ctr_command = ["sudo", "-n", wrapper]
+        import_command = lambda archive: [
+            *ctr_command, "import", str(archive)
+        ]
+        list_command = [*ctr_command, "list"]
+
+    else:
+        if not Path(k3s_cli).is_file():
+            raise RuntimeError(
+                f"K3s CLI not found: {k3s_cli}"
+            )
+
+        ctr_command = [k3s_cli, "ctr", "--namespace", "k8s.io"]
+
+        import_command = lambda archive: [
+            *ctr_command, "images", "import", str(archive)
+        ]
+        list_command = [
+            *ctr_command, "images", "list", "-q"
+        ]
+
+    # Confirm that Docker has the image.
+    inspect = run_cmd(
+        [_docker_cli(), "image", "inspect", image],
+        timeout=30,
+        cancel_check=cancel_check,
+    )
+
     if inspect.returncode:
-        raise RuntimeError(f"Docker image is not available for K3s import: {image}")
-    with tempfile.TemporaryDirectory(prefix="codedeck-image-") as directory:
+        raise RuntimeError(
+            f"Docker image is not available for K3s import: {image}"
+        )
+
+    with tempfile.TemporaryDirectory(
+        prefix="codedeck-image-"
+    ) as directory:
+
         archive = Path(directory) / "image.tar"
-        try:
-            proc = run_cmd(["docker", "save", "-o", str(archive), image], timeout=300, cancel_check=cancel_check)
-            if proc.returncode:
-                raise RuntimeError((proc.stderr or proc.stdout or "docker save failed")[-2000:])
-            ctr = (["sudo", "-n", "k3s", "ctr"] if settings.k3s_ctr_use_sudo else ["k3s", "ctr"])
-            proc = run_cmd([*ctr, "--namespace", "k8s.io", "images", "import", str(archive)], timeout=300, cancel_check=cancel_check)
-            if proc.returncode:
-                raise RuntimeError((proc.stderr or proc.stdout or "K3s image import failed")[-2000:])
-            listed = run_cmd([*ctr, "--namespace", "k8s.io", "images", "list", "-q"], timeout=30, cancel_check=cancel_check)
-            if listed.returncode:
-                raise RuntimeError((listed.stderr or listed.stdout or "Could not verify K3s image import")[-2000:])
-            candidates = {image, f"docker.io/{image}"}
-            if "/" not in image.split(":", 1)[0]:
-                candidates.add(f"docker.io/library/{image}")
-            if not candidates.intersection(set((listed.stdout or "").splitlines())):
-                raise RuntimeError(f"K3s import completed but image '{image}' is not visible in containerd namespace k8s.io")
-        except FileNotFoundError as exc:
-            raise RuntimeError("Docker and K3s CLIs must be installed on the worker") from exc
-    logger.info("Docker image imported into K3s containerd: %s", image)
+
+        # Export image from Docker.
+        proc = run_cmd(
+            ["docker", "save", "-o", str(archive), image],
+            timeout=300,
+            cancel_check=cancel_check,
+        )
+
+        if proc.returncode:
+            raise RuntimeError(
+                (proc.stderr or proc.stdout or "docker save failed")[-2000:]
+            )
+
+        # Import image into K3s containerd.
+        proc = run_cmd(
+            import_command(archive),
+            timeout=300,
+            cancel_check=cancel_check,
+        )
+
+        if proc.returncode:
+            raise RuntimeError(
+                (proc.stderr or proc.stdout or "K3s image import failed")[-2000:]
+            )
+
+        # Verify that the image is available in K3s.
+        listed = run_cmd(
+            list_command,
+            timeout=30,
+            cancel_check=cancel_check,
+        )
+
+        if listed.returncode:
+            raise RuntimeError(
+                (listed.stderr or listed.stdout or
+                 "Could not verify K3s image import")[-2000:]
+            )
+
+        candidates = {
+            image,
+            f"docker.io/{image}",
+        }
+
+        if "/" not in image.split(":", 1)[0]:
+            candidates.add(f"docker.io/library/{image}")
+
+        available_images = set(
+            (listed.stdout or "").splitlines()
+        )
+
+        if not candidates.intersection(available_images):
+            raise RuntimeError(
+                f"K3s import completed but image '{image}' "
+                "is not visible in containerd namespace k8s.io"
+            )
+
+    logger.info(
+        "Docker image imported into K3s containerd: %s",
+        image,
+    )
+
 
 
 def shutil_which(command: str) -> bool:

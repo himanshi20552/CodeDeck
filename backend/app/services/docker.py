@@ -10,6 +10,7 @@ from pathlib import Path
 from collections.abc import Callable
 
 from app.core.config import settings
+from app.core.deployment_context import deployment_target
 from app.services.observability import measured
 from app.services.deployment_control import DeploymentCancelled
 
@@ -252,6 +253,9 @@ def kind_load_image(
     cluster: str = "deploymind",
     cancel_check: Callable[[], bool] | None = None,
 ) -> None:
+    if deployment_target() in {"remote", "k3s"}:
+        _k3s_load_image(image, cancel_check=cancel_check)
+        return
     logger.info("Loading docker image '%s' into kind cluster '%s'...", image, cluster)
 
     # 1. Try standard kind load
@@ -323,5 +327,31 @@ def kind_load_image(
         msg = f"Failed to load image into kind node '{node_name}': {exc}"
         logger.error(msg)
         raise RuntimeError(msg) from exc
+
+
+def _k3s_load_image(image: str, cancel_check: Callable[[], bool] | None = None) -> None:
+    """Transfer a Docker-built image into K3s' separate containerd image store."""
+    import tempfile
+
+    if not shutil_which("k3s"):
+        raise RuntimeError("K3s CLI is required on the remote deployment worker")
+    with tempfile.TemporaryDirectory(prefix="codedeck-image-") as directory:
+        archive = Path(directory) / "image.tar"
+        try:
+            proc = run_cmd(["docker", "save", "-o", str(archive), image], timeout=300, cancel_check=cancel_check)
+            if proc.returncode:
+                raise RuntimeError((proc.stderr or proc.stdout or "docker save failed")[-2000:])
+            ctr = (["sudo", "-n", "k3s", "ctr"] if settings.k3s_ctr_use_sudo else ["k3s", "ctr"])
+            proc = run_cmd([*ctr, "--namespace", "k8s.io", "images", "import", str(archive)], timeout=300, cancel_check=cancel_check)
+            if proc.returncode:
+                raise RuntimeError((proc.stderr or proc.stdout or "K3s image import failed")[-2000:])
+        except FileNotFoundError as exc:
+            raise RuntimeError("Docker and K3s CLIs must be installed on the worker") from exc
+    logger.info("Docker image imported into K3s containerd: %s", image)
+
+
+def shutil_which(command: str) -> bool:
+    from shutil import which
+    return which(command) is not None
 
 

@@ -10,7 +10,7 @@ from fastapi.responses import JSONResponse, Response
 from fastapi import Request
 from fastapi.exceptions import RequestValidationError
 
-from app.api import analysis, deployments, projects, system
+from app.api import analysis, deployments, projects, system, worker
 from app.core.config import settings
 from app.db.database import init_db
 from app.services.observability import (
@@ -62,6 +62,7 @@ app.include_router(projects.router)
 app.include_router(analysis.router)
 app.include_router(deployments.router)
 app.include_router(system.router)
+app.include_router(worker.router)
 
 
 @app.exception_handler(RequestValidationError)

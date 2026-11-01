@@ -4,6 +4,7 @@ import re
 import shutil
 import stat
 import subprocess
+import base64
 from pathlib import Path
 from urllib.parse import urlparse
 
@@ -24,7 +25,10 @@ def validate_github_url(url: str) -> str:
         url = url[:-4]
     if not GITHUB_URL_RE.match(url):
         raise ValueError("Invalid GitHub repository URL")
-    return url
+    host_and_path = url.split("://", 1)[1]
+    if host_and_path.lower().startswith("www.github.com/"):
+        host_and_path = host_and_path[len("www."):]
+    return "https://" + host_and_path
 
 
 def repo_name_from_url(url: str) -> str:
@@ -33,11 +37,7 @@ def repo_name_from_url(url: str) -> str:
 
 
 def _clone_url(url: str) -> str:
-    if not settings.github_token:
-        return url + ".git"
-    # token only used for git auth; never logged
-    parsed = urlparse(url)
-    return f"https://x-access-token:{settings.github_token}@{parsed.netloc}{parsed.path}.git"
+    return url + ".git"
 
 
 def _handle_remove_readonly(func, path, exc_info):
@@ -70,6 +70,11 @@ def clone_repository(url: str, dest: Path) -> Path:
     try:
         env = os.environ.copy()
         env["GIT_TERMINAL_PROMPT"] = "0"
+        if settings.github_token:
+            credential = base64.b64encode(f"x-access-token:{settings.github_token}".encode()).decode("ascii")
+            env["GIT_CONFIG_COUNT"] = "1"
+            env["GIT_CONFIG_KEY_0"] = "http.https://github.com/.extraheader"
+            env["GIT_CONFIG_VALUE_0"] = f"AUTHORIZATION: basic {credential}"
         proc = subprocess.run(
             ["git", "clone", "--depth", "1", "--single-branch", _clone_url(url), str(dest)],
             capture_output=True,

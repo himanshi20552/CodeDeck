@@ -1,3 +1,5 @@
+from typing import Literal
+
 from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
@@ -23,6 +25,18 @@ class Settings(BaseSettings):
     kind_cluster_name: str = "deploymind"
     k8s_namespace: str = "deploymind"
     kubeconfig: str = ""
+    deployment_target: Literal["remote", "local"] = "remote"
+    local_kind_enabled: bool = False
+    remote_worker_url: str = ""
+    remote_worker_token: str = ""
+    worker_id: str = "codedeck-worker"
+    worker_poll_interval: int = Field(default=5, ge=1, le=60)
+    worker_heartbeat_interval: int = Field(default=15, ge=5, le=300)
+    k3s_ingress_domain: str = ""
+    k3s_ctr_use_sudo: bool = False
+    k3s_deployment_timeout: int = Field(default=600, ge=60, le=3600)
+    deployment_max_concurrent_jobs: int = Field(default=1, ge=1, le=8)
+    deployment_retention_hours: int = Field(default=168, ge=1, le=8760)
     docker_build_timeout: int = 1800
     database_connect_timeout: int = Field(default=5, ge=1, le=60)
     langfuse_public_key: str = ""

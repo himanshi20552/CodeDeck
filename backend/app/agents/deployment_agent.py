@@ -1,6 +1,8 @@
 import logging
+import os
 import re
 import shutil
+import httpx
 from pathlib import Path
 from typing import Callable
 from urllib.parse import unquote, urlsplit
@@ -14,6 +16,7 @@ from app.agents.kubernetes_agent import (
     staging_namespace,
 )
 from app.core.config import settings
+from app.core.deployment_context import deployment_target
 from app.services import docker as docker_svc
 from app.services import kubernetes as k8s_svc
 from app.services.dependency_sanitizer import choose_python_base_image, sanitize_requirements_file
@@ -126,6 +129,37 @@ spec:
       targetPort: {container_port}
       nodePort: {node_port}
 """
+
+
+def _detect_application_port(analysis: dict, dockerfile: Path, manifests: dict[str, str]) -> int:
+    """Resolve the container port from analysis, Dockerfile, or generated Service manifests."""
+    candidates: list[int] = []
+    try:
+        if analysis.get("port"):
+            candidates.append(int(analysis["port"]))
+    except (TypeError, ValueError):
+        pass
+    try:
+        for match in re.finditer(r"^\s*EXPOSE\s+(\d+)", dockerfile.read_text(encoding="utf-8", errors="ignore"), re.MULTILINE | re.IGNORECASE):
+            candidates.append(int(match.group(1)))
+    except OSError:
+        pass
+    try:
+        import yaml
+        for content in manifests.values():
+            for document in yaml.safe_load_all(content):
+                if not isinstance(document, dict) or document.get("kind") != "Service":
+                    continue
+                for service_port in document.get("spec", {}).get("ports", []):
+                    target = service_port.get("targetPort")
+                    if isinstance(target, int):
+                        candidates.append(target)
+    except Exception:
+        pass
+    port = next((value for value in candidates if 1 <= value <= 65535), None)
+    if port is None:
+        raise RuntimeError("Application port was not detected; specify it in repository analysis or a Kubernetes Service targetPort")
+    return port
 
 
 def _collect_runtime_env(
@@ -330,11 +364,20 @@ def _prepare_deployment_source(project_id: int, repository_url: str, dest: Path)
         try:
             shutil.copytree(cached_src, dest)
             logger.info("Reused local repository cache from %s for project %d deployment", cached_src, project_id)
-            return dest
         except Exception as exc:
             logger.warning("Failed to copy cached repository (%s); re-cloning...", exc)
             cleanup_repository(dest)
-    return clone_repository(repository_url, dest)
+            clone_repository(repository_url, dest)
+    else:
+        clone_repository(repository_url, dest)
+    # Never let Git credential metadata enter a Docker build context.
+    for root, directories, files in os.walk(dest):
+        if ".git" in directories:
+            shutil.rmtree(Path(root) / ".git", ignore_errors=True)
+            directories.remove(".git")
+        if ".git" in files:
+            (Path(root) / ".git").unlink(missing_ok=True)
+    return dest
 
 
 class StagingDeployResult(BaseModel):
@@ -344,6 +387,7 @@ class StagingDeployResult(BaseModel):
     image: str = ""
     namespace: str = ""
     app_name: str = ""
+    application_port: int = 0
     rollout: str = ""
     smoke: dict = Field(default_factory=dict)
     deployment_status: dict = Field(default_factory=dict)
@@ -617,11 +661,12 @@ def deploy_staging(
     progress: Callable[[str], None] | None = None,
     cancel_check: Callable[[], bool] | None = None,
     namespace: str | None = None,
+    image_tag: str | None = None,
 ) -> StagingDeployResult:
     app_name = sanitize_name(repository_name or analysis.get("repository_name") or "app")
     namespace = namespace or staging_namespace(settings.k8s_namespace, project_id, "legacy")
     cluster = settings.kind_cluster_name
-    image = f"deploymind/{app_name}:staging"
+    image = f"deploymind/{app_name}:{image_tag or 'staging'}"
     dest = Path(settings.workspace_dir) / f"project_{project_id}_deploy"
 
     logger.info("deployment started: staging %s", app_name)
@@ -704,11 +749,11 @@ def deploy_staging(
             context_dir,
             dockerfile_path,
             image,
-            timeout=1800,
+            timeout=settings.docker_build_timeout,
             cancel_check=cancel_check,
             progress_callback=lambda line: report(f"Building container image: {line}"),
         )
-        report("Loading image into kind")
+        report("Loading image into Kubernetes container runtime")
         docker_svc.kind_load_image(image, cluster=cluster, cancel_check=cancel_check)
 
         local_files = {
@@ -719,7 +764,7 @@ def deploy_staging(
         if not local_files:
             raise RuntimeError("No Kubernetes manifests found. Run analysis first.")
 
-        port = int(analysis.get("port") or 8000)
+        port = _detect_application_port(analysis, dockerfile_path, k8s_files)
         database = analysis.get("database")
         staging_dependencies = list(analysis.get("staging_dependencies") or [])
         env_vars = _collect_runtime_env(app_name, app_dir, port, database, staging_dependencies)
@@ -738,13 +783,39 @@ def deploy_staging(
                         meta["name"] = f"{app_name}-staging"
             patched["deployment.yaml"] = _yaml.dump_all(docs, default_flow_style=False)
 
-        # Inject a NodePort service so the app is reachable from the host browser
-        # without manual kubectl port-forward.
-        port = int(analysis.get("port") or 8000)
-        node_port = _allocate_node_port(f"{app_name}-{namespace}")
-        patched["nodeport-service.yaml"] = _nodeport_service_manifest(
-            app_name, port, node_port, namespace
-        )
+        # Local kind keeps its developer-facing NodePort. Remote K3s exposes
+        # applications through Traefik only when an operator has configured a domain.
+        ingress_hostname = None
+        if deployment_target() not in {"remote", "k3s"}:
+            node_port = _allocate_node_port(f"{app_name}-{namespace}")
+            patched["nodeport-service.yaml"] = _nodeport_service_manifest(
+                app_name, port, node_port, namespace
+            )
+        elif settings.k3s_ingress_domain:
+            ingress_domain = settings.k3s_ingress_domain.strip(".").lower()
+            if not re.fullmatch(r"[a-z0-9](?:[a-z0-9.-]{0,251}[a-z0-9])?", ingress_domain):
+                raise RuntimeError("K3S_INGRESS_DOMAIN must be a DNS hostname")
+            ingress_hostname = f"app-{image_tag or project_id}.{ingress_domain}"
+            patched["ingress.yaml"] = f"""apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: {app_name}
+  annotations:
+    traefik.ingress.kubernetes.io/router.entrypoints: web
+spec:
+  ingressClassName: traefik
+  rules:
+    - host: {ingress_hostname}
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: {app_name}
+                port:
+                  number: 80
+"""
         if database and "database.yaml" not in patched:
             database_manifest = generate_database_manifest(app_name, database)
             if database_manifest:
@@ -788,7 +859,7 @@ def deploy_staging(
         rollout = k8s_svc.wait_rollout(
             deploy_name,
             namespace=namespace,
-            timeout_s=300,
+            timeout_s=settings.k3s_deployment_timeout if deployment_target() in {"remote", "k3s"} else 300,
             cancel_check=cancel_check,
             progress_callback=lambda detail: report(f"Waiting for application rollout: {detail}"),
         )
@@ -804,8 +875,22 @@ def deploy_staging(
         if smoke.get("status") != "passed":
             raise RuntimeError(smoke.get("message") or "Smoke test failed")
 
-        access_url = f"http://localhost:3000/api/projects/{project_id}/preview/docs"
-        smoke["url"] = access_url
+        if deployment_target() in {"remote", "k3s"}:
+            if ingress_hostname:
+                ingress_url = f"http://{ingress_hostname}"
+                try:
+                    ingress_response = httpx.get(ingress_url, timeout=10.0, follow_redirects=True)
+                    if ingress_response.status_code >= 500:
+                        raise RuntimeError(f"Ingress returned HTTP {ingress_response.status_code}")
+                    smoke["ingress_status_code"] = ingress_response.status_code
+                except Exception as exc:
+                    raise RuntimeError(f"Configured ingress is not reachable at {ingress_url}: {exc}") from exc
+            access_url = f"http://{ingress_hostname}" if ingress_hostname else None
+            smoke["url"] = access_url
+            smoke["access"] = "ingress" if ingress_hostname else "worker-port-forward"
+        else:
+            access_url = f"http://localhost:3000/api/projects/{project_id}/preview/docs"
+            smoke["url"] = access_url
         report("Staging deployment healthy")
         logger.info("deployment completed: staging %s accessible at %s", app_name, access_url)
         return StagingDeployResult(
@@ -813,10 +898,15 @@ def deploy_staging(
             image=image,
             namespace=namespace,
             app_name=app_name,
+            application_port=port,
             rollout=rollout,
             smoke=smoke,
             deployment_status=status,
-            message=f"Staging healthy — open {access_url} in your browser ({smoke.get('message')})",
+            message=(
+                f"Staging healthy at {access_url} ({smoke.get('message')})"
+                if access_url else
+                f"Staging healthy; no public hostname is configured. Use a worker-side kubectl port-forward for temporary access ({smoke.get('message')})"
+            ),
         )
     finally:
         cleanup_repository(dest)

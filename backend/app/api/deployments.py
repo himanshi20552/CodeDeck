@@ -1,11 +1,13 @@
 import logging
 import re
+from datetime import datetime, timezone
 from uuid import uuid4
 
 import httpx
-from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Request, Response
+from fastapi import APIRouter, BackgroundTasks, Body, Depends, HTTPException, Request, Response
 from fastapi.responses import JSONResponse, RedirectResponse
 from sqlalchemy.orm import Session
+from pydantic import BaseModel
 
 from app.agents.deployment_agent import (
     deploy_green as run_production_green,
@@ -16,6 +18,7 @@ from app.agents.deployment_agent import (
 from app.agents.kubernetes_agent import sanitize_name, staging_namespace
 from app.api.schemas import DeploymentOut
 from app.core.config import settings
+from app.core.deployment_context import use_deployment_target
 from app.db.database import SessionLocal, get_db
 from app.db.models import Analysis, Deployment, GeneratedFile, Project
 from app.services import kubernetes as k8s_svc
@@ -26,6 +29,10 @@ from app.services.deployment_control import DeploymentCancelled
 
 router = APIRouter(prefix="/api/projects", tags=["deployments"])
 logger = logging.getLogger("deploymind")
+
+
+class DeploymentTargetRequest(BaseModel):
+    target: str = "remote"
 
 
 def _get_project(project_id: int, db: Session) -> Project:
@@ -84,7 +91,7 @@ def _cleanup_canceled_staging(app_name: str, namespace: str) -> None:
         logger.warning("Could not clean up canceled staging resources", exc_info=True)
 
 
-def _bg_deploy_staging(project_id: int, namespace: str | None = None):
+def _bg_deploy_staging(project_id: int, namespace: str | None = None, target: str = "local"):
     db = SessionLocal()
     project = None
     try:
@@ -100,25 +107,28 @@ def _bg_deploy_staging(project_id: int, namespace: str | None = None):
         dockerfile = files.get("Dockerfile", "")
         k8s_files = {k: v for k, v in files.items() if k != "Dockerfile"}
 
-        result = run_staging(
-            project_id=project_id,
-            repository_url=project.repository_url,
-            repository_name=project.repository_name,
-            analysis=analysis.analysis_result or {} if analysis else {},
-            dockerfile=dockerfile,
-            k8s_files=k8s_files,
-            progress=lambda message: _report_staging_progress(project_id, message),
-            cancel_check=lambda: _staging_cancel_requested(project_id),
-            namespace=namespace,
-        )
+        with use_deployment_target(target):
+            result = run_staging(
+                project_id=project_id,
+                repository_url=project.repository_url,
+                repository_name=project.repository_name,
+                analysis=analysis.analysis_result or {} if analysis else {},
+                dockerfile=dockerfile,
+                k8s_files=k8s_files,
+                progress=lambda message: _report_staging_progress(project_id, message),
+                cancel_check=lambda: _staging_cancel_requested(project_id),
+                namespace=namespace,
+            )
 
+        result_details = result.model_dump()
+        result_details["target"] = "local-kind"
         row = Deployment(
             project_id=project_id,
             environment="staging",
             version="blue",
             status=result.status,
             deployment_type="staging",
-            details=result.model_dump(),
+            details=result_details,
         )
         db.add(row)
         project.status = "staging_healthy"
@@ -129,7 +139,8 @@ def _bg_deploy_staging(project_id: int, namespace: str | None = None):
         project = db.get(Project, project_id)
         if project:
             upsert_step(db, project_id, "Staging", "running", result="Cleaning up staging resources")
-            _cleanup_canceled_staging(sanitize_name(project.repository_name or "app"), namespace)
+            with use_deployment_target(target):
+                _cleanup_canceled_staging(sanitize_name(project.repository_name or "app"), namespace)
             project.status = "ready"
             upsert_step(db, project_id, "Staging", "warning", result="Staging deployment canceled")
             db.add(
@@ -234,7 +245,12 @@ def _bg_deploy_production(project_id: int):
 
 
 @router.post("/{project_id}/deploy/staging", status_code=202)
-def deploy_staging(project_id: int, background_tasks: BackgroundTasks, db: Session = Depends(get_db)):
+def deploy_staging(
+    project_id: int,
+    background_tasks: BackgroundTasks,
+    body: DeploymentTargetRequest = Body(default=DeploymentTargetRequest()),
+    db: Session = Depends(get_db),
+):
     project = _get_project(project_id, db)
     if project.status in {"deploying", "staging_cancel_requested"}:
         raise HTTPException(status_code=409, detail="A staging operation is already active for this project")
@@ -254,18 +270,79 @@ def deploy_staging(project_id: int, background_tasks: BackgroundTasks, db: Sessi
     if contract.status == "blocked":
         return _fail("staging", contract.summary, "; ".join(check.message for check in contract.checks if check.status == "blocked"))
 
+    target = body.target
+    if target not in {"remote", "local"}:
+        raise HTTPException(status_code=422, detail="Deployment target must be remote or local")
+    if target == "local" and not (settings.local_kind_enabled or settings.deployment_target == "local"):
+        raise HTTPException(status_code=403, detail="Local kind is disabled by the backend configuration")
+
+    if target == "remote":
+        if not settings.remote_worker_token:
+            raise HTTPException(status_code=503, detail="Remote deployment is selected but REMOTE_WORKER_TOKEN is not configured on the backend")
+        namespace = staging_namespace(settings.k8s_namespace, project_id, uuid4().hex[:8])
+        row = Deployment(
+            project_id=project_id,
+            environment="staging",
+            version="blue",
+            status="QUEUED",
+            deployment_type="remote_staging",
+            details={
+                "target": "aws-ec2-k3s",
+                "namespace": namespace,
+                "logs": [{"message": "Deployment queued for the EC2 worker"}],
+                "worker_payload": {
+                    "project_id": project_id,
+                    "repository_url": project.repository_url,
+                    "repository_name": project.repository_name,
+                    "analysis": dict(analysis.analysis_result or {}),
+                    "k8s_files": {name: content for name, content in files.items() if name.lower().endswith((".yaml", ".yml"))},
+                    "namespace": namespace,
+                },
+            },
+        )
+        db.add(row)
+        project.status = "deploying"
+        upsert_step(db, project_id, "Staging", "running", result="Queued for remote EC2 / K3s worker")
+        db.commit()
+        db.refresh(row)
+        return {"status": "QUEUED", "deployment_id": row.id, "message": "Deployment queued for the remote K3s worker"}
+
     upsert_step(db, project_id, "Staging", "running")
     project.status = "deploying"
     db.commit()
 
     namespace = staging_namespace(settings.k8s_namespace, project_id, uuid4().hex[:8])
-    background_tasks.add_task(_bg_deploy_staging, project_id, namespace)
-    return {"status": "deploying", "message": "Staging deployment started in background"}
+    background_tasks.add_task(_bg_deploy_staging, project_id, namespace, target)
+    return {"status": "deploying", "target": "local-kind", "message": "Local kind staging deployment started in background"}
 
 
 @router.post("/{project_id}/deploy/staging/cancel")
 def cancel_staging(project_id: int, db: Session = Depends(get_db)):
     project = _get_project(project_id, db)
+    queued_job = (
+        db.query(Deployment)
+        .filter(Deployment.project_id == project_id, Deployment.deployment_type == "remote_staging", Deployment.status == "QUEUED")
+        .order_by(Deployment.created_at.desc())
+        .first()
+    )
+    if queued_job:
+        details = dict(queued_job.details or {})
+        details.pop("worker_payload", None)
+        details["failure_reason"] = "Cancelled while queued"
+        details["completed_at"] = datetime.now(timezone.utc).isoformat()
+        queued_job.details = details
+        queued_job.status = "CANCELLED"
+        project.status = "ready"
+        upsert_step(db, project_id, "Staging", "warning", result="Queued remote deployment cancelled")
+        db.commit()
+        return {"status": "CANCELLED", "message": "Queued deployment cancelled"}
+    running_remote = db.query(Deployment).filter(
+        Deployment.project_id == project_id,
+        Deployment.deployment_type == "remote_staging",
+        Deployment.status.in_(["RUNNING", "BUILDING", "DEPLOYING", "VERIFYING"]),
+    ).first()
+    if running_remote:
+        raise HTTPException(status_code=409, detail="The EC2 worker cannot interrupt a build already in progress; wait for it to finish or fail")
     if project.status not in {"deploying", "staging_cancel_requested"}:
         return _fail("staging_cancel", "There is no active staging deployment to cancel")
     if project.status == "staging_cancel_requested":
@@ -278,6 +355,8 @@ def cancel_staging(project_id: int, db: Session = Depends(get_db)):
 
 @router.post("/{project_id}/deploy/production", status_code=202)
 def deploy_production(project_id: int, background_tasks: BackgroundTasks, db: Session = Depends(get_db)):
+    if settings.deployment_target == "remote":
+        raise HTTPException(status_code=501, detail="Production blue-green operations have not been migrated to the remote worker")
     project = _get_project(project_id, db)
     analysis = db.query(Analysis).filter(Analysis.project_id == project_id).first()
     if not analysis:
@@ -303,6 +382,8 @@ def deploy_production(project_id: int, background_tasks: BackgroundTasks, db: Se
 
 @router.post("/{project_id}/deploy/production/approve")
 def approve_production(project_id: int, db: Session = Depends(get_db)):
+    if settings.deployment_target == "remote":
+        raise HTTPException(status_code=501, detail="Production traffic switching is not available through the remote worker yet")
     project = _get_project(project_id, db)
     app_name = sanitize_name(project.repository_name or "app")
 
@@ -337,6 +418,8 @@ def approve_production(project_id: int, db: Session = Depends(get_db)):
 
 @router.post("/{project_id}/rollback")
 def rollback(project_id: int, db: Session = Depends(get_db)):
+    if settings.deployment_target == "remote":
+        raise HTTPException(status_code=501, detail="Production rollback is not available through the remote worker yet")
     project = _get_project(project_id, db)
     app_name = sanitize_name(project.repository_name or "app")
 
@@ -380,10 +463,72 @@ def list_deployments(project_id: int, db: Session = Depends(get_db)):
     )
 
 
+@router.get("/{project_id}/deployments/{deployment_id}/logs")
+def deployment_logs(project_id: int, deployment_id: int, db: Session = Depends(get_db)):
+    _get_project(project_id, db)
+    row = db.get(Deployment, deployment_id)
+    if row is None or row.project_id != project_id:
+        raise HTTPException(status_code=404, detail="Deployment not found")
+    details = row.details or {}
+    return {"deployment_id": row.id, "status": row.status, "logs": details.get("logs", [])}
+
+
+@router.get("/{project_id}/deployments/{deployment_id}", response_model=DeploymentOut)
+def get_deployment(project_id: int, deployment_id: int, db: Session = Depends(get_db)):
+    _get_project(project_id, db)
+    row = db.get(Deployment, deployment_id)
+    if row is None or row.project_id != project_id:
+        raise HTTPException(status_code=404, detail="Deployment not found")
+    return row
+
+
+@router.post("/{project_id}/deployments/{deployment_id}/cleanup", status_code=202)
+def cleanup_remote_deployment(project_id: int, deployment_id: int, db: Session = Depends(get_db)):
+    project = _get_project(project_id, db)
+    deployment = db.get(Deployment, deployment_id)
+    if deployment is None or deployment.project_id != project_id:
+        raise HTTPException(status_code=404, detail="Deployment not found")
+    if deployment.deployment_type != "remote_staging" or deployment.status != "SUCCEEDED":
+        raise HTTPException(status_code=409, detail="Only a completed remote staging deployment can be cleaned up")
+    if project.status in {"deploying", "staging_cancel_requested"}:
+        raise HTTPException(status_code=409, detail="Wait for the active staging operation before cleaning up a deployment")
+    namespace = (deployment.details or {}).get("namespace")
+    if not namespace:
+        raise HTTPException(status_code=409, detail="Deployment has no recorded namespace")
+    if not settings.remote_worker_token:
+        raise HTTPException(status_code=503, detail="Remote worker is not configured")
+    row = Deployment(
+        project_id=project_id,
+        environment="staging",
+        version="cleanup",
+        status="QUEUED",
+        deployment_type="remote_cleanup",
+        details={
+            "target": "aws-ec2-k3s",
+            "namespace": namespace,
+            "logs": [{"message": "Namespace cleanup queued"}],
+            "source_deployment_id": deployment.id,
+            "worker_payload": {"operation": "cleanup", "namespace": namespace, "source_deployment_id": deployment.id},
+        },
+    )
+    db.add(row)
+    project.status = "deploying"
+    db.commit()
+    db.refresh(row)
+    return {"status": "QUEUED", "deployment_id": row.id, "message": "Remote namespace cleanup queued"}
+
+
 @router.api_route("/{project_id}/preview", methods=["GET", "POST", "PUT", "DELETE", "PATCH", "HEAD", "OPTIONS"])
 @router.api_route("/{project_id}/preview/{subpath:path}", methods=["GET", "POST", "PUT", "DELETE", "PATCH", "HEAD", "OPTIONS"])
 async def preview_app(project_id: int, request: Request, subpath: str = "", db: Session = Depends(get_db)):
     project = _get_project(project_id, db)
+    latest_remote = db.query(Deployment).filter(
+        Deployment.project_id == project_id,
+        Deployment.deployment_type == "remote_staging",
+        Deployment.status == "SUCCEEDED",
+    ).order_by(Deployment.created_at.desc()).first()
+    if latest_remote and settings.deployment_target == "remote":
+        raise HTTPException(status_code=501, detail="Remote applications use their configured ingress URL; the control-plane preview proxy is local-kind only")
     app_name = sanitize_name(project.repository_name or "app")
     latest_healthy_staging = (
         db.query(Deployment)

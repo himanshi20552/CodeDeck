@@ -13,6 +13,7 @@ from collections.abc import Callable
 import httpx
 
 from app.core.config import settings
+from app.core.deployment_context import deployment_target
 from app.services.deployment_control import DeploymentCancelled
 from app.services.observability import measured
 
@@ -28,6 +29,13 @@ def _run(args: list[str], timeout: int = 180) -> subprocess.CompletedProcess[str
 
 def prepare_kubeconfig() -> str | None:
     """Make kubectl work from inside the backend container against a local kind cluster."""
+    if deployment_target() in {"remote", "k3s"}:
+        configured = Path(settings.kubeconfig) if settings.kubeconfig else Path("/etc/rancher/k3s/k3s.yaml")
+        if configured.is_file():
+            settings.kubeconfig = str(configured)
+            os.environ["KUBECONFIG"] = str(configured)
+            return str(configured)
+        return None
     cluster = settings.kind_cluster_name
     out = Path(settings.workspace_dir) / "kubeconfig"
     out.parent.mkdir(parents=True, exist_ok=True)
@@ -89,14 +97,107 @@ def cluster_reachable() -> bool:
 
 def ensure_namespace(namespace: str) -> None:
     proc = _run(["kubectl", "get", "ns", namespace], timeout=30)
-    if proc.returncode == 0:
-        return
-    create = _run(["kubectl", "create", "namespace", namespace], timeout=30)
-    if create.returncode != 0:
-        raise RuntimeError(f"Failed to create namespace: {create.stderr or create.stdout}")
+    if proc.returncode != 0:
+        create = _run(["kubectl", "create", "namespace", namespace], timeout=30)
+        if create.returncode != 0:
+            raise RuntimeError(f"Failed to create namespace: {create.stderr or create.stdout}")
+    if deployment_target() in {"remote", "k3s"}:
+        quota = f"""apiVersion: v1
+kind: ResourceQuota
+metadata:
+  name: codedeck-budget
+  namespace: {namespace}
+spec:
+  hard:
+    requests.cpu: "4"
+    requests.memory: 8Gi
+    limits.cpu: "8"
+    limits.memory: 16Gi
+    pods: "10"
+    services: "10"
+---
+apiVersion: v1
+kind: LimitRange
+metadata:
+  name: codedeck-defaults
+  namespace: {namespace}
+spec:
+  limits:
+    - type: Container
+      defaultRequest:
+        cpu: 100m
+        memory: 128Mi
+      default:
+        cpu: 500m
+        memory: 512Mi
+      max:
+        cpu: "2"
+        memory: 4Gi
+"""
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".yaml", encoding="utf-8", delete=False) as stream:
+            stream.write(quota)
+            quota_file = stream.name
+        try:
+            applied = _run(["kubectl", "apply", "-f", quota_file], timeout=30)
+            if applied.returncode:
+                raise RuntimeError(f"Could not apply namespace resource limits: {applied.stderr or applied.stdout}")
+        finally:
+            Path(quota_file).unlink(missing_ok=True)
+
+
+def _validate_remote_manifests(files: dict[str, str]) -> None:
+    """Reject cluster-wide and host escape primitives in untrusted manifests."""
+    import yaml
+
+    permitted_kinds = {
+        "Deployment", "Service", "Ingress", "NetworkPolicy", "ConfigMap", "Secret", "ServiceAccount", "Role",
+        "RoleBinding", "PersistentVolumeClaim",
+    }
+
+    def walk(value):
+        if isinstance(value, dict):
+            if value.get("hostPath"):
+                raise ValueError("Remote deployment rejected a hostPath volume")
+            if value.get("hostPort"):
+                raise ValueError("Remote deployment rejected a hostPort")
+            security = value.get("securityContext")
+            if isinstance(security, dict) and security.get("privileged") is True:
+                raise ValueError("Remote deployment rejected a privileged container")
+            if isinstance(security, dict) and security.get("procMount") == "Unmasked":
+                raise ValueError("Remote deployment rejected an unmasked proc mount")
+            capabilities = value.get("capabilities")
+            if isinstance(capabilities, dict) and capabilities.get("add"):
+                raise ValueError("Remote deployment rejected added Linux capabilities")
+            if value.get("hostNetwork") is True or value.get("hostPID") is True or value.get("hostIPC") is True:
+                raise ValueError("Remote deployment rejected host namespace access")
+            for child in value.values():
+                walk(child)
+        elif isinstance(value, list):
+            for child in value:
+                walk(child)
+
+    for filename, content in files.items():
+        for document in yaml.safe_load_all(content):
+            if not document:
+                continue
+            kind = document.get("kind")
+            if kind not in permitted_kinds:
+                raise ValueError(f"Remote deployment rejected unsupported Kubernetes resource kind in {filename}: {kind}")
+            if kind == "Role":
+                for rule in document.get("rules", []):
+                    if set(rule.get("apiGroups", [])) - {""} or set(rule.get("resources", [])) - {"pods", "services", "configmaps"} or set(rule.get("verbs", [])) - {"get", "list", "watch"}:
+                        raise ValueError("Remote deployment rejected elevated namespace Role permissions")
+            if kind == "RoleBinding" and document.get("roleRef", {}).get("kind") != "Role":
+                raise ValueError("Remote deployment rejected RoleBinding to a cluster-wide role")
+            walk(document)
 
 
 def apply_manifests(files: dict[str, str], namespace: str) -> None:
+    if deployment_target() in {"remote", "k3s"}:
+        _validate_remote_manifests(files)
+    for name in files:
+        if Path(name).name != name or "\\" in name or not name.lower().endswith((".yaml", ".yml")):
+            raise ValueError(f"Invalid Kubernetes manifest filename: {name}")
     ensure_namespace(namespace)
     with tempfile.TemporaryDirectory(prefix="deploymind-k8s-") as tmp:
         tmp_path = Path(tmp)

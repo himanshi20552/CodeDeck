@@ -123,6 +123,10 @@ export type Deployment = {
 };
 
 export type SystemStatus = {
+  deployment_target: string;
+  deployment_targets: string[];
+  local_kind?: { ok: boolean; clusters?: string[]; message: string };
+  worker: { online: boolean; worker_id: string; last_seen: string | null; message: string; queue_length: number | null; details: Record<string, unknown> };
   backend: { ok: boolean; message: string };
   database: { ok: boolean; message: string };
   docker: { ok: boolean; message: string };
@@ -144,9 +148,10 @@ export const getFiles = (id: number) => request<GeneratedFile[]>(`/api/projects/
 export const askRepositoryQuestion = (id: number, question: string) => request<RepositoryAnswer>(`/api/projects/${id}/qa`, { method: 'POST', body: JSON.stringify({ question }) });
 export const getEvaluation = (id: number) => request<Evaluation>(`/api/projects/${id}/evaluation`);
 export const runAiTests = (id: number) => request<GeneratedTestRun>(`/api/projects/${id}/ai-tests`, { method: 'POST' });
-export const deployStaging = (id: number) => request<{ status: string; message: string }>(`/api/projects/${id}/deploy/staging`, { method: 'POST' });
+export const deployStaging = (id: number, target = 'remote') => request<{ status: string; message: string; deployment_id?: number }>(`/api/projects/${id}/deploy/staging`, { method: 'POST', body: JSON.stringify({ target }) });
 export const cancelStaging = (id: number) => request<{ status: string; message: string }>(`/api/projects/${id}/deploy/staging/cancel`, { method: 'POST' });
 export const deployProduction = (id: number) => request<{ status: string; message: string }>(`/api/projects/${id}/deploy/production`, { method: 'POST' });
 export const approveProduction = (id: number) => request<{ status: string; message: string }>(`/api/projects/${id}/deploy/production/approve`, { method: 'POST' });
 export const rollbackProduction = (id: number) => request<{ status: string; message: string }>(`/api/projects/${id}/rollback`, { method: 'POST' });
 export const listDeployments = (id: number) => request<Deployment[]>(`/api/projects/${id}/deployments`);
+export const cleanupDeployment = (projectId: number, deploymentId: number) => request<{ status: string; message: string }>(`/api/projects/${projectId}/deployments/${deploymentId}/cleanup`, { method: 'POST' });

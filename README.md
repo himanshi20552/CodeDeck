@@ -15,24 +15,20 @@ GitHub Repo -> Analysis -> RAG Q&A -> AI Testing -> Docker Build -> Kubernetes D
 | **Backend** | FastAPI, Python, PostgreSQL (SQLAlchemy), LangGraph |
 | **Frontend** | React 19, TypeScript, Vite, Tailwind CSS v4 |
 | **AI / NLP** | OpenAI, Groq, or xAI with local semantic embeddings, BM25 and Reciprocal Rank Fusion |
-| **DevOps** | Docker, kind (Kubernetes in Docker), kubectl |
+| **DevOps** | Remote EC2 worker, Docker, K3s, kubectl (local kind remains optional) |
 
 ## Quick Start
 
 ### Prerequisites
-- Docker & Docker Compose
-- `kind` CLI installed
-- `kubectl` CLI installed
+- Docker & Docker Compose for running CodeDeck locally
+- AWS EC2 Ubuntu host bootstrapped with K3s and the CodeDeck deployment worker for remote staging
 - An API key for OpenAI, Groq, or xAI (optional; grounded heuristic Q&A remains available)
 
 ### Setup Instructions
 
-1. **Ensure the kind cluster is running:**
-   ```bash
-   kind create cluster --name deploymind
-   ```
+1. **Configure the remote worker:** copy `.env.example` to `.env`, set `DEPLOYMENT_TARGET=remote`, configure `REMOTE_WORKER_URL` and a strong shared `REMOTE_WORKER_TOKEN`, then follow [AWS EC2 Setup](docs/AWS_EC2_SETUP.md). Keep worker secrets out of frontend variables.
 
-2. **Start the platform:**
+2. **Start the control plane:**
    ```bash
    docker compose up -d --build
    ```
@@ -75,7 +71,7 @@ GitHub Repo -> Analysis -> RAG Q&A -> AI Testing -> Docker Build -> Kubernetes D
 ## Health, tests and monitoring
 
 - `/health/live` checks process liveness; `/health/ready` checks database readiness.
-- `/api/system/status` and `/api/system/integrations` report backend and optional integration status.
+- `/api/system/status`, `/api/system/worker`, and `/api/system/integrations` report backend and optional integration status.
 - `/metrics` exposes Prometheus metrics when the dependency is installed.
 - Grafana: `http://localhost:3001`; Prometheus: `http://localhost:9090`. Configure credentials in `.env`.
 - Backend tests: `cd backend; ..\\.venv\\Scripts\\python.exe -m pytest -q` (or `pytest -q` in an activated environment).
@@ -84,8 +80,10 @@ GitHub Repo -> Analysis -> RAG Q&A -> AI Testing -> Docker Build -> Kubernetes D
 
 Copy `.env.example` to `.env`. The first semantic index may download FastEmbed's BGE-small model; no hosted embeddings API is used. Set `SEMANTIC_EMBEDDINGS_ENABLED=false` for lexical-only operation or deterministic tests.
 
-## Local staging and implementation notes
+## Deployment notes
 
-Local staging requires Docker and a reachable kind cluster. After analyzing a project, run `./scripts/stage-project.ps1 -ProjectId <id>` from PowerShell to request staging and wait for the actual rollout and smoke-test result. GitHub-hosted CI validates and builds images but does not pretend to reach a developer's local cluster.
+Remote staging is the default target. FastAPI stores a queued deployment in PostgreSQL; the EC2 worker polls, builds, imports the image into K3s containerd, applies manifests, waits for rollout, and persists status and logs. See [Remote Deployment Architecture](docs/REMOTE_DEPLOYMENT_ARCHITECTURE.md), [K3s Deployment](docs/K3S_DEPLOYMENT.md), and [Deployment Security](docs/DEPLOYMENT_SECURITY.md). To expose the optional Local kind choice in the dashboard, set `LOCAL_KIND_ENABLED=true` on the backend and provide local Docker/kind/kubectl access. GitHub Actions do not deploy to EC2.
+
+When a K3s ingress domain is configured, the worker reports an HTTP hostname after smoke testing. Without a domain, the worker verifies through a worker-local port-forward and reports no public URL. HTTPS and automated namespace cleanup are not implemented.
 
 Read [Architecture](docs/ARCHITECTURE.md), [Hybrid Search](docs/HYBRID_SEARCH.md), [Langfuse](docs/LANGFUSE.md), [Monitoring](docs/MONITORING.md), [CI/CD](docs/CI_CD.md), and [Reliability](docs/RELIABILITY.md) for current implementation details and limitations.

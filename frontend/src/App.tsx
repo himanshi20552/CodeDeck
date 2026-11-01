@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState, type FormEvent } from 'react'
 import {
-  approveProduction, askRepositoryQuestion, cancelStaging, createProject,
+  approveProduction, askRepositoryQuestion, cancelStaging, cleanupDeployment, createProject,
   deployProduction, deployStaging, getAnalysis, getEvaluation,
   getFiles, getHealth, getPipeline, getProject, getSystemStatus,
   listDeployments, listProjects, rollbackProduction, runAiTests,
@@ -179,6 +179,7 @@ export default function App() {
   const [evaluation, setEvaluation] = useState<Evaluation | null>(null)
   const [aiTests, setAiTests] = useState<GeneratedTestRun | null>(null)
   const [systemStatus, setSystemStatus] = useState<SystemStatus | null>(null)
+  const [deploymentTarget, setDeploymentTarget] = useState('remote')
   const [apiOk, setApiOk] = useState<boolean | null>(null)
   const [busy, setBusy] = useState(false)
   const [deploying, setDeploying] = useState(false)
@@ -202,6 +203,17 @@ export default function App() {
     getHealth().then(() => setApiOk(true)).catch(() => setApiOk(false))
     listProjects().then(setProjects).catch(() => setProjects([]))
     getSystemStatus().then(setSystemStatus).catch(() => setSystemStatus(null))
+  }, [])
+
+  useEffect(() => {
+    if (systemStatus) setDeploymentTarget(systemStatus.deployment_target)
+  }, [systemStatus?.deployment_target])
+
+  useEffect(() => {
+    const timer = window.setInterval(() => {
+      getSystemStatus().then(setSystemStatus).catch(() => setSystemStatus(null))
+    }, 15000)
+    return () => window.clearInterval(timer)
   }, [])
 
   // Poll serially while a server-side operation is active. Stop after 30 minutes.
@@ -344,7 +356,7 @@ export default function App() {
     setError(null)
     log('Docker/K8s', 'Starting staging deployment…')
     try {
-      await deployStaging(selected.id)
+      await deployStaging(selected.id, deploymentTarget)
       const [steps, fresh, deps] = await Promise.all([
         getPipeline(selected.id), getProject(selected.id), listDeployments(selected.id),
       ])
@@ -450,37 +462,10 @@ export default function App() {
   } | undefined
   const latestDeployment = deployments[0]
   const smokeResult = (latestDeployment?.details as { smoke?: Record<string, unknown> } | null)?.smoke
+  const remoteApplicationUrl = typeof smokeResult?.url === 'string' ? smokeResult.url : null
   const failureAnalysis = (latestDeployment?.details as { failure_analysis?: Record<string, unknown> } | null)?.failure_analysis
   const stagingStep = pipelineMap['Staging']
   const stagingPhase = stagingStep?.result ?? 'Queued for staging deployment'
-  const stagingProgressMap: Record<string, number> = {
-    'Checking Kubernetes cluster': 8,
-    'Preparing repository source': 18,
-    'Building container image': 38,
-    'Loading image into kind': 58,
-    'Starting staging database': 70,
-    'Starting staging services': 70,
-    'Waiting for staging redis': 76,
-    'Waiting for staging kafka': 78,
-    'Applying Kubernetes manifests': 80,
-    'Waiting for application rollout': 90,
-    'Running staging smoke tests': 96,
-    'Cleaning up staging resources': 8,
-    'Staging deployment healthy': 100,
-  }
-  const dynamicStagingProgress = [
-    ['Building container image:', 'Building container image'],
-    ['Waiting for staging database:', 'Starting staging database'],
-    ['Waiting for staging redis:', 'Waiting for staging redis'],
-    ['Waiting for staging kafka:', 'Waiting for staging kafka'],
-    ['Waiting for application rollout:', 'Waiting for application rollout'],
-    ['Running staging smoke tests:', 'Running staging smoke tests'],
-  ].find(([prefix]) => stagingPhase.startsWith(prefix))
-  const stagingProgress = stagingStep?.status === 'completed'
-    ? 100
-    : dynamicStagingProgress
-      ? stagingProgressMap[dynamicStagingProgress[1]]
-      : stagingProgressMap[stagingPhase] ?? 4
   const stagingIsActive = selected?.status === 'deploying' || selected?.status === 'staging_cancel_requested' || stagingStep?.status === 'running'
 
   // ── sidebar ─────────────────────────────────────────────────────────────
@@ -575,7 +560,7 @@ export default function App() {
                 >
                   {deploying ? 'Deploying…' : 'Deploy Staging'}
                 </button>
-                {selected.status === 'staging_healthy' && (
+                {selected.status === 'staging_healthy' && deploymentTarget === 'local' && systemStatus?.deployment_target === 'local' && (
                   <button
                     onClick={() => deployProduction(selected.id)}
                     disabled={deployingProd || busy}
@@ -1116,11 +1101,35 @@ export default function App() {
           {/* ── KUBERNETES ── */}
           {page === 'kubernetes' && (
             <div className="space-y-6 max-w-3xl">
-              <SectionTitle>Kubernetes / kind</SectionTitle>
+              <SectionTitle>Remote Deployment / K3s</SectionTitle>
               {!selected ? (
                 <p className="text-sm text-zinc-500">Load a repository first.</p>
               ) : (
                 <>
+                  <div className="rounded border border-zinc-800 bg-zinc-900/50 p-4">
+                    <div className="mb-3 text-[10px] uppercase tracking-widest text-zinc-500">Infrastructure</div>
+                    <label className="mb-3 flex items-center gap-3 text-xs text-zinc-300">
+                      <span>Deployment target</span>
+                      <select
+                        value={deploymentTarget}
+                        onChange={event => setDeploymentTarget(event.target.value)}
+                        className="rounded border border-zinc-700 bg-zinc-950 px-2 py-1 text-xs"
+                      >
+                        {(systemStatus?.deployment_targets ?? ['remote']).map(target => (
+                          <option key={target} value={target}>{target === 'remote' ? 'AWS EC2 / K3s (Primary)' : 'Local kind (Development)'}</option>
+                        ))}
+                      </select>
+                    </label>
+                    <div className="grid gap-3 sm:grid-cols-3">
+                      <Pill label="Deployment Target" value={deploymentTarget === 'remote' ? 'AWS EC2 / K3s' : 'Local kind'} />
+                      <Pill label={deploymentTarget === 'remote' ? 'EC2 Worker' : 'Local kind'} value={deploymentTarget === 'remote' ? (systemStatus?.worker?.online ? 'Connected' : 'Offline') : (systemStatus?.local_kind?.ok ? 'Ready' : 'Unavailable')} />
+                      <Pill label={deploymentTarget === 'remote' ? 'K3s Node' : 'kind Cluster'} value={deploymentTarget === 'remote' ? (systemStatus?.worker?.details?.node_status ? String(systemStatus.worker.details.node_status) : 'Waiting for worker health') : (systemStatus?.local_kind?.clusters?.join(', ') || 'No kind cluster')} />
+                    </div>
+                    <div className="mt-2 text-[11px] text-zinc-500">
+                      {deploymentTarget === 'remote' ? (systemStatus?.worker?.message ?? 'Worker status unavailable') : (systemStatus?.local_kind?.message ?? 'Local kind status unavailable')}
+                      {deploymentTarget === 'remote' && systemStatus?.worker?.last_seen && ` · Last heartbeat ${new Date(systemStatus.worker.last_seen).toLocaleString()}`}
+                    </div>
+                  </div>
                   {/* Pipeline steps for K8s */}
                   {(['Docker', 'Kubernetes', 'Staging'] as const).map(name => {
                     const step = pipelineMap[name]
@@ -1253,7 +1262,7 @@ export default function App() {
                         {cancelingStaging || selected.status === 'staging_cancel_requested' ? 'Canceling Staging…' : 'Cancel Staging'}
                       </button>
                     )}
-                    {selected.status === 'staging_healthy' && (
+                    {selected.status === 'staging_healthy' && deploymentTarget === 'local' && systemStatus?.deployment_target === 'local' && (
                       <button
                         onClick={() => { setDeployingProd(true); deployProduction(selected.id).finally(() => { setDeployingProd(false); loadProject(selected) }) }}
                         disabled={deployingProd}
@@ -1262,7 +1271,7 @@ export default function App() {
                         {deployingProd ? 'Deploying GREEN…' : 'Deploy Production (GREEN)'}
                       </button>
                     )}
-                    {['staging_healthy', 'production_awaiting_approval', 'production_healthy', 'rolled_back'].includes(selected.status) && (
+                    {(deploymentTarget === 'local' && ['staging_healthy', 'production_awaiting_approval', 'production_healthy', 'rolled_back'].includes(selected.status)) && (
                       <a
                         href={`/api/projects/${selected.id}/preview/docs`}
                         target="_blank"
@@ -1273,23 +1282,83 @@ export default function App() {
                         <span className="text-[10px] opacity-75">↗</span>
                       </a>
                     )}
+                    {deploymentTarget === 'remote' && remoteApplicationUrl && selected.status === 'staging_healthy' && (
+                      <a href={remoteApplicationUrl} target="_blank" rel="noopener noreferrer" className="rounded bg-purple-700 px-4 py-2 text-xs font-medium text-white hover:bg-purple-600">
+                        Open Deployed Application
+                      </a>
+                    )}
+                    {deploymentTarget === 'remote' && selected.status === 'staging_healthy' && (
+                      <span className="text-[11px] text-zinc-500">Remote production blue-green controls are not available yet.</span>
+                    )}
+                    {deploymentTarget === 'local' && systemStatus?.deployment_target === 'remote' && selected.status === 'staging_healthy' && (
+                      <span className="text-[11px] text-zinc-500">Blue-green production controls require `DEPLOYMENT_TARGET=local` on the backend.</span>
+                    )}
                   </div>
 
                   {stagingIsActive && (
                     <div className="rounded border border-sky-800/50 bg-sky-950/20 p-4 text-xs">
                       <div className="mb-2 flex items-center justify-between gap-3">
-                        <span className="font-medium text-sky-200">{selected.status === 'staging_cancel_requested' ? 'Canceling staging deployment' : 'Staging deployment in progress'}</span>
-                        <span className="font-mono text-sky-400">{stagingProgress}%</span>
-                      </div>
-                      <div className="h-1.5 overflow-hidden rounded bg-zinc-800">
-                        <div className="h-full rounded bg-sky-500 transition-all duration-500" style={{ width: `${stagingProgress}%` }} />
+                        <span className="font-medium text-sky-200">{selected.status === 'staging_cancel_requested' ? 'Canceling staging deployment' : 'Remote staging deployment'}</span>
+                        <span className="font-mono text-sky-400">{latestDeployment?.status ?? 'RUNNING'}</span>
                       </div>
                       <p className="mt-2 text-[11px] text-sky-300/80">{selected.status === 'staging_cancel_requested' && stagingPhase === 'Cleaning up staging resources' ? stagingPhase : selected.status === 'staging_cancel_requested' ? 'Stopping the active staging operation…' : stagingPhase}</p>
                     </div>
                   )}
 
+                  {deployments.length > 0 && (
+                    <div className="rounded border border-zinc-800 bg-zinc-900/50 p-4">
+                      <div className="mb-3 text-[10px] uppercase tracking-widest text-zinc-500">Deployment History and Worker Logs</div>
+                      <div className="space-y-3">
+                        {deployments.map(deployment => {
+                          const details = (deployment.details ?? {}) as {
+                            target?: string; namespace?: string; image?: string; app_name?: string;
+                            ingress_hostname?: string; application_port?: number; failure_reason?: string;
+                            logs?: Array<{ time?: string; message?: string }>;
+                            smoke?: { status?: string; url?: string | null; message?: string };
+                            result?: { rollout?: string; deployment_status?: { ready_replicas?: number; replicas?: number } };
+                          }
+                          return (
+                            <div key={deployment.id} className="rounded border border-zinc-800 p-3 text-xs">
+                              <div className="flex flex-wrap items-center justify-between gap-2">
+                                <span className="font-semibold text-zinc-200">#{deployment.id} · {deployment.status}</span>
+                                <span className="text-zinc-500">{deployment.created_at ? new Date(deployment.created_at).toLocaleString() : ''}</span>
+                              </div>
+                              <div className="mt-2 grid gap-2 sm:grid-cols-2 text-zinc-400">
+                                <span>Target: {details.target ?? deployment.deployment_type}</span>
+                                <span>Namespace: {details.namespace ?? '—'}</span>
+                                <span>Image: {details.image ?? '—'}</span>
+                                <span>Deployment / Service: {details.app_name ?? '—'}</span>
+                                <span>Application port: {details.application_port ?? '—'}</span>
+                                <span>Pod readiness: {details.result?.deployment_status?.ready_replicas ?? 0}/{details.result?.deployment_status?.replicas ?? '—'}</span>
+                                <span>Smoke test: {details.smoke?.status ?? 'pending'}</span>
+                                <span>URL: {details.smoke?.url ?? 'No public hostname configured'}</span>
+                              </div>
+                              {details.failure_reason && <p className="mt-2 text-red-400">{details.failure_reason}</p>}
+                              {deployment.deployment_type === 'remote_staging' && deployment.status === 'SUCCEEDED' && (
+                                <button
+                                  onClick={async () => {
+                                    try {
+                                      await cleanupDeployment(selected.id, deployment.id)
+                                      await loadProject(selected)
+                                    } catch (err) {
+                                      setError(err instanceof Error ? err.message : 'Cleanup could not be queued')
+                                    }
+                                  }}
+                                  className="mt-3 rounded border border-red-800/70 px-3 py-1.5 text-[11px] text-red-300 hover:bg-red-950/30"
+                                >Queue namespace cleanup</button>
+                              )}
+                              {details.logs?.length ? (
+                                <TerminalBlock text={details.logs.map(line => `${line.time ?? ''} ${line.message ?? ''}`.trim()).join('\n')} maxH="10rem" />
+                              ) : null}
+                            </div>
+                          )
+                        })}
+                      </div>
+                    </div>
+                  )}
+
                   {/* Approval banner */}
-                  {selected.status === 'production_awaiting_approval' && (
+                  {deploymentTarget === 'local' && systemStatus?.deployment_target === 'local' && selected.status === 'production_awaiting_approval' && (
                     <div className="rounded border border-yellow-700/50 bg-yellow-950/30 p-4">
                       <div className="text-sm font-medium text-yellow-300 mb-2">Production Approval Required</div>
                       <p className="text-xs text-yellow-400 mb-3">GREEN version deployed and verified. Test via Live Preview, then approve to switch live traffic.</p>

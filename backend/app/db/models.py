@@ -58,6 +58,14 @@ class Deployment(Base):
     project = relationship("Project", back_populates="deployments")
 
 
+class WorkerHeartbeat(Base):
+    __tablename__ = "worker_heartbeats"
+
+    worker_id: Mapped[str] = mapped_column(String(100), primary_key=True)
+    last_seen: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
+    details: Mapped[dict | None] = mapped_column(JSONType)
+
+
 class PipelineStep(Base):
     __tablename__ = "pipeline_steps"
 

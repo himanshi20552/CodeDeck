@@ -1,4 +1,5 @@
 import re
+import tomllib
 from pathlib import Path
 
 SUSPICIOUS_REQUIREMENT_NAMES = {"install"}
@@ -67,13 +68,15 @@ def choose_python_base_image(repo_dir: Path, default_tag: str = "3.11-slim") -> 
     # pinning greenlet 1.x). Use the same compatibility rule for requirements
     # and Poetry's package/version entries so generated staging images match
     # the dependency set the repository actually locked.
+    legacy_python_310 = False
     requirements = repo_dir / "requirements.txt"
     if requirements.is_file():
         for line in requirements.read_text(encoding="utf-8", errors="ignore").splitlines():
             name, version = _parse_requirement_version(line)
             threshold = LEGACY_PYTHON_310_PACKAGES.get(name or "")
             if threshold and version and version < threshold:
-                return "python:3.10-slim"
+                legacy_python_310 = True
+                break
 
     poetry_lock = repo_dir / "poetry.lock"
     if poetry_lock.is_file():
@@ -88,6 +91,31 @@ def choose_python_base_image(repo_dir: Path, default_tag: str = "3.11-slim") -> 
                 version = _parse_requirement_version(f"{package_name}=={version_match.group(1)}")[1]
                 threshold = LEGACY_PYTHON_310_PACKAGES.get(package_name)
                 if threshold and version and version < threshold:
-                    return "python:3.10-slim"
+                    legacy_python_310 = True
+                    break
                 package_name = None
-    return f"python:{default_tag}"
+
+    default_match = re.match(r"^(\d+)\.(\d+)", default_tag)
+    default_version = (
+        (int(default_match.group(1)), int(default_match.group(2)))
+        if default_match else (3, 11)
+    )
+    minimum_version: tuple[int, int] | None = None
+    pyproject = repo_dir / "pyproject.toml"
+    if pyproject.is_file():
+        try:
+            project = tomllib.loads(pyproject.read_text(encoding="utf-8", errors="ignore")).get("project", {})
+            requires_python = project.get("requires-python", "")
+            # PEP 621 commonly expresses the lower supported runtime as
+            # ``>=3.14`` or ``~=3.14``. Keep the default for older/equal
+            # minima, but never generate an image below the declared minimum.
+            lower_bounds = re.findall(r"(?:>=|~=)\s*(\d+)\.(\d+)", requires_python)
+            if lower_bounds:
+                minimum_version = max((int(major), int(minor)) for major, minor in lower_bounds)
+        except (OSError, tomllib.TOMLDecodeError, AttributeError, TypeError):
+            minimum_version = None
+
+    if legacy_python_310 and (minimum_version is None or minimum_version <= (3, 10)):
+        return "python:3.10-slim"
+    selected = max(default_version, minimum_version or default_version)
+    return f"python:{selected[0]}.{selected[1]}-slim"

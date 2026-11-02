@@ -436,6 +436,7 @@ def kind_load_image(
 
 
 
+
 def _k3s_load_image(
     image: str,
     cancel_check: Callable[[], bool] | None = None,
@@ -447,18 +448,17 @@ def _k3s_load_image(
     wrapper = "/usr/local/sbin/codedeck-k3s-ctr"
     k3s_cli = "/usr/local/bin/k3s"
 
-    # Select the restricted wrapper for remote EC2 deployments.
     if settings.k3s_ctr_use_sudo:
         if not Path(wrapper).is_file():
             raise RuntimeError(
                 f"Restricted K3s wrapper not found: {wrapper}"
             )
 
-        ctr_command = ["sudo", "-n", wrapper]
+        # The helper will run with root privileges through systemd.
         import_command = lambda archive: [
-            *ctr_command, "import", str(archive)
+            wrapper, "import", str(archive)
         ]
-        list_command = [*ctr_command, "list"]
+        list_command = [wrapper, "list"]
 
     else:
         if not Path(k3s_cli).is_file():
@@ -466,7 +466,9 @@ def _k3s_load_image(
                 f"K3s CLI not found: {k3s_cli}"
             )
 
-        ctr_command = [k3s_cli, "ctr", "--namespace", "k8s.io"]
+        ctr_command = [
+            k3s_cli, "ctr", "--namespace", "k8s.io"
+        ]
 
         import_command = lambda archive: [
             *ctr_command, "images", "import", str(archive)
@@ -475,7 +477,6 @@ def _k3s_load_image(
             *ctr_command, "images", "list", "-q"
         ]
 
-    # Confirm that Docker has the image.
     inspect = run_cmd(
         [_docker_cli(), "image", "inspect", image],
         timeout=30,
@@ -493,9 +494,14 @@ def _k3s_load_image(
 
         archive = Path(directory) / "image.tar"
 
-        # Export image from Docker.
         proc = run_cmd(
-            ["docker", "save", "-o", str(archive), image],
+            [
+                _docker_cli(),
+                "save",
+                "-o",
+                str(archive),
+                image,
+            ],
             timeout=300,
             cancel_check=cancel_check,
         )
@@ -505,7 +511,6 @@ def _k3s_load_image(
                 (proc.stderr or proc.stdout or "docker save failed")[-2000:]
             )
 
-        # Import image into K3s containerd.
         proc = run_cmd(
             import_command(archive),
             timeout=300,
@@ -517,7 +522,6 @@ def _k3s_load_image(
                 (proc.stderr or proc.stdout or "K3s image import failed")[-2000:]
             )
 
-        # Verify that the image is available in K3s.
         listed = run_cmd(
             list_command,
             timeout=30,
@@ -526,8 +530,11 @@ def _k3s_load_image(
 
         if listed.returncode:
             raise RuntimeError(
-                (listed.stderr or listed.stdout or
-                 "Could not verify K3s image import")[-2000:]
+                (
+                    listed.stderr
+                    or listed.stdout
+                    or "Could not verify K3s image import"
+                )[-2000:]
             )
 
         candidates = {

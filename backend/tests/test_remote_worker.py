@@ -90,7 +90,13 @@ def test_remote_image_import_explicitly_uses_k3s_containerd(monkeypatch, tmp_pat
         return subprocess.CompletedProcess(args, 0, "", "")
 
     monkeypatch.setattr(settings, "deployment_target", "remote")
-    monkeypatch.setattr(docker, "shutil_which", lambda name: name == "k3s")
+    monkeypatch.setattr(settings, "k3s_ctr_use_sudo", False)
+    original_is_file = docker.Path.is_file
+    monkeypatch.setattr(
+        docker.Path,
+        "is_file",
+        lambda path: str(path).replace("\\", "/") == "/usr/local/bin/k3s" or original_is_file(path),
+    )
     monkeypatch.setattr(docker, "_docker_cli", lambda: "/usr/bin/docker")
     monkeypatch.setattr(docker, "run_cmd", fake_run)
     docker._k3s_load_image("deploymind/demo:d9")
@@ -98,7 +104,7 @@ def test_remote_image_import_explicitly_uses_k3s_containerd(monkeypatch, tmp_pat
     assert commands[0][1:3] == ["image", "inspect"]
     assert commands[1][1:3] == ["save", "-o"]
     assert commands[0][-1] == "deploymind/demo:d9"
-    assert commands[2] == ["k3s", "ctr", "--namespace", "k8s.io", "images", "import", commands[2][-1]]
+    assert commands[2] == ["/usr/local/bin/k3s", "ctr", "--namespace", "k8s.io", "images", "import", commands[2][-1]]
     assert commands[3][-3:] == ["images", "list", "-q"]
 
 

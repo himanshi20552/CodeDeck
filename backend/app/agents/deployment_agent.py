@@ -549,7 +549,7 @@ def _reliable_staging_dockerfile(app_dir: Path, analysis: dict) -> str:
 WORKDIR /app
 RUN apt-get update && apt-get install -y --no-install-recommends gcc libsqlite3-dev && rm -rf /var/lib/apt/lists/*
 COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt || pip install --no-cache-dir -r requirements.txt --ignore-requires-python
+RUN pip install --no-cache-dir -r requirements.txt
 RUN pip install --no-cache-dir aiosqlite 2>/dev/null || true
 {runtime_dependency}COPY . .
 RUN useradd --create-home --uid 1000 appuser && chown -R appuser:appuser /app
@@ -567,8 +567,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends gcc libsqlite3-
 COPY pyproject.toml* uv.lock* README* ./
 COPY . .
 RUN pip install --no-cache-dir --upgrade pip && \\
-    pip install --no-cache-dir . 2>/dev/null || \\
-    pip install --no-cache-dir fastapi uvicorn sqlalchemy aiosqlite pydantic pydantic-settings
+    pip install --no-cache-dir .
 {runtime_dependency}RUN useradd --create-home --uid 1000 appuser && chown -R appuser:appuser /app
 USER appuser
 EXPOSE {port}
@@ -581,7 +580,7 @@ WORKDIR /app
 RUN apt-get update && apt-get install -y --no-install-recommends gcc libsqlite3-dev && rm -rf /var/lib/apt/lists/*
 RUN pip install --no-cache-dir "poetry>=1.8,<2.0"
 COPY pyproject.toml* poetry.lock* ./
-RUN poetry config virtualenvs.create false && (poetry install --no-interaction --no-ansi --no-root --only main || poetry install --no-interaction --no-ansi --no-root)
+RUN poetry config virtualenvs.create false && poetry install --no-interaction --no-ansi --no-root --only main
 COPY . .
 {runtime_dependency}RUN useradd --create-home --uid 1000 appuser && chown -R appuser:appuser /app
 USER appuser
@@ -594,8 +593,8 @@ EXPOSE {port}
 WORKDIR /app
 RUN apt-get update && apt-get install -y --no-install-recommends gcc libsqlite3-dev && rm -rf /var/lib/apt/lists/*
 COPY pyproject.toml .
-RUN pip install --no-cache-dir . || pip install --no-cache-dir fastapi uvicorn aiosqlite
 COPY . .
+RUN pip install --no-cache-dir .
 {runtime_dependency}RUN useradd --create-home --uid 1000 appuser && chown -R appuser:appuser /app
 USER appuser
 EXPOSE {port}

@@ -59,6 +59,33 @@ def test_generate_legacy_fastapi_dockerfile_uses_python_310(tmp_path):
     assert "FROM python:3.10-slim" in result.dockerfile
 
 
+def test_python_base_image_respects_pyproject_minimum_version(tmp_path):
+    from app.services.dependency_sanitizer import choose_python_base_image
+
+    (tmp_path / "pyproject.toml").write_text(
+        '[project]\nname = "template-backend"\nrequires-python = ">=3.14,<4.0"\n'
+        'dependencies = ["sqlmodel>=0.0.46"]\n',
+        encoding="utf-8",
+    )
+    assert choose_python_base_image(tmp_path) == "python:3.14-slim"
+
+
+def test_staging_pyproject_install_uses_declared_dependencies_and_fails_fast(tmp_path):
+    (tmp_path / "pyproject.toml").write_text(
+        '[project]\nname = "template-backend"\nrequires-python = ">=3.14,<4.0"\n'
+        'dependencies = ["fastapi", "sqlmodel"]\n',
+        encoding="utf-8",
+    )
+    dockerfile = _reliable_staging_dockerfile(
+        tmp_path,
+        {"language": "Python", "framework": "FastAPI", "package_manager": "pip", "entrypoint": "app.main:app"},
+    )
+
+    assert "FROM python:3.14-slim" in dockerfile
+    assert "COPY . .\nRUN pip install --no-cache-dir ." in dockerfile
+    assert "|| pip install --no-cache-dir fastapi" not in dockerfile
+
+
 def test_adjust_python_base_image_rewrites_old_generated_dockerfile(tmp_path):
     (tmp_path / "requirements.txt").write_text(
         "fastapi==0.75.1\norjson==3.6.7\ngreenlet==1.1.2\nhttptools==0.2.0\n",

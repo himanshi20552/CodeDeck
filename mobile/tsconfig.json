@@ -2,8 +2,7 @@
   "extends": "expo/tsconfig.base",
   "compilerOptions": {
     "strict": true,
-    "noEmit": true,
-    "baseUrl": "."
+    "noEmit": true
   },
   "include": ["**/*.ts", "**/*.tsx"]
 }

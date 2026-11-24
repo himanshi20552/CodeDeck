@@ -75,6 +75,68 @@ def test_rejected_release_cannot_queue_production(monkeypatch):
     db.close()
 
 
+def test_approval_demo_is_development_local_only(monkeypatch):
+    monkeypatch.setattr(settings, "release_approval_demo_mode", True)
+    monkeypatch.setattr(settings, "codedeck_environment", "development")
+    monkeypatch.setattr(settings, "deployment_target", "local")
+    assert approvals._manager_read_auth(None) == "demo"
+    monkeypatch.setattr(settings, "codedeck_environment", "production")
+    with pytest.raises(HTTPException) as exc:
+        approvals._manager_read_auth(None)
+    assert exc.value.status_code == 503
+
+
+def test_approval_demo_is_disabled_without_explicit_flag(monkeypatch):
+    monkeypatch.setattr(settings, "release_approval_demo_mode", False)
+    monkeypatch.setattr(settings, "release_approval_token", "")
+    with pytest.raises(HTTPException) as exc:
+        approvals._manager_read_auth(None)
+    assert exc.value.status_code == 503
+
+
+def test_demo_approval_is_audited_without_starting_production(monkeypatch):
+    from fastapi import BackgroundTasks
+
+    monkeypatch.setattr(settings, "release_approval_demo_mode", True)
+    monkeypatch.setattr(settings, "codedeck_environment", "development")
+    monkeypatch.setattr(settings, "deployment_target", "local")
+    db = Session()
+    project, staging = release_fixture(db)
+    approval, _ = request_release_approval(db, project, staging, "developer")
+    assert approvals._approval_detail(db, approval)["demo_mode"] is True
+    queued = BackgroundTasks()
+    result = approvals._decision(approval.id, "approved", approvals.DecisionRequest(comments="Reviewed in demo"),
+                                queued, None, "untrusted browser label", db)
+    db.refresh(approval)
+    events = db.query(ReleaseApprovalEvent).filter_by(approval_id=approval.id).all()
+    decision_event = next(event for event in events if event.event_type == "approval_approved")
+    assert result["demo_mode"] is True
+    assert approval.status == "Approved"
+    assert approval.approver_identity == "Demo Manager (demo)"
+    assert approval.approver_identity_verified is False
+    assert approval.comments.startswith("[DEMO MODE]")
+    assert decision_event.details["demo_mode"] is True
+    assert decision_event.details["identity_verified"] is False
+    assert not queued.tasks
+    assert project.status == "staging_healthy"
+    db.close()
+
+
+def test_demo_rejection_requires_a_reason(monkeypatch):
+    monkeypatch.setattr(settings, "release_approval_demo_mode", True)
+    monkeypatch.setattr(settings, "codedeck_environment", "development")
+    monkeypatch.setattr(settings, "deployment_target", "local")
+    db = Session()
+    project, staging = release_fixture(db)
+    approval, _ = request_release_approval(db, project, staging, "developer")
+    with pytest.raises(HTTPException) as exc:
+        approvals._decision(approval.id, "rejected", approvals.DecisionRequest(comments="  "),
+                            __import__("fastapi").BackgroundTasks(), None, None, db)
+    assert exc.value.status_code == 422
+    assert approval.status == "Awaiting Approval"
+    db.close()
+
+
 def test_remote_staging_worker_completion_records_verification(monkeypatch):
     db = Session(); project, staging = release_fixture(db, status="RUNNING")
     staging.deployment_type = "remote_staging"

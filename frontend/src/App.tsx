@@ -1,9 +1,9 @@
 import { useEffect, useRef, useState, type FormEvent } from 'react'
 import {
-  approveProduction, askRepositoryQuestion, cancelStaging, cleanupDeployment, configureAutoscaling, disableAutoscaling, getAutoscaling, clearProjectWorkspace, deleteProject, createProject,
+  askRepositoryQuestion, cancelStaging, cleanupDeployment, configureAutoscaling, disableAutoscaling, getAutoscaling, clearProjectWorkspace, deleteProject, createProject,
   deployProduction, deployStaging, getAnalysis, getEvaluation,
   getFiles, getHealth, getMonitoringDashboard, getPipeline, getProject, getReleaseWorkflow, getSystemStatus,
-  listDeployments, listProjects, rollbackProduction, runAiTests,
+  listDeployments, listProjects, runAiTests,
   startAnalysis,
   type Analysis, type Deployment, type Evaluation, type GeneratedFile,
   type GeneratedTestRun, type PipelineStep, type Project,
@@ -172,7 +172,7 @@ function FormattedText({ text, className = '' }: { text?: string | null; classNa
           return (
             <div key={idx} className="flex gap-2 items-start ml-1 text-zinc-300">
               <span className="text-sky-400 font-bold shrink-0">•</span>
-              <span>{renderInlineFormatting(trimmed.replace(/^[*\-]\s+/, ''))}</span>
+              <span>{renderInlineFormatting(trimmed.replace(/^[*-]\s+/, ''))}</span>
             </div>
           )
         }
@@ -230,8 +230,6 @@ export default function App() {
   const [deploying, setDeploying] = useState(false)
   const [cancelingStaging, setCancelingStaging] = useState(false)
   const [deployingProd, setDeployingProd] = useState(false)
-  const [approvingProd, setApprovingProd] = useState(false)
-  const [rollingBack, setRollingBack] = useState(false)
   const [askingQuestion, setAskingQuestion] = useState(false)
   const [runningAiTests, setRunningAiTests] = useState(false)
   const [loadingEval, setLoadingEval] = useState(false)
@@ -535,37 +533,23 @@ export default function App() {
     }
   }
 
-  async function onApprove() {
+  async function onRequestReleaseApproval() {
     if (!selected) return
-    setApprovingProd(true)
+    if (!window.confirm('Request manager review for the verified staging release? This creates a pending approval request; it does not start production deployment.')) return
+    setDeployingProd(true)
+    setError(null)
     try {
-      await approveProduction(selected.id)
-      const [steps, fresh, deps, workflow] = await Promise.all([
-        getPipeline(selected.id), getProject(selected.id), listDeployments(selected.id), getReleaseWorkflow(selected.id),
-      ])
-      setPipeline(steps); setSelected(fresh); setDeployments(deps); setReleaseWorkflow(workflow)
-      log('Kubernetes', 'Traffic switched to GREEN')
+      const result = await deployProduction(selected.id)
+      log('Release', result.message || `Approval request ${result.status}`)
+      window.alert(result.message || `Approval request ${result.status}`)
+      const [fresh, workflow] = await Promise.all([getProject(selected.id), getReleaseWorkflow(selected.id)])
+      setSelected(fresh); setReleaseWorkflow(workflow)
     } catch (err) {
-      setError(err instanceof Error ? err.message : 'Approval failed')
+      const message = err instanceof Error ? err.message : 'Approval request could not be submitted'
+      setError(message)
+      log('Release', `Approval request error: ${message}`)
     } finally {
-      setApprovingProd(false)
-    }
-  }
-
-  async function onRollback() {
-    if (!selected) return
-    setRollingBack(true)
-    try {
-      await rollbackProduction(selected.id)
-      const [steps, fresh, deps, workflow] = await Promise.all([
-        getPipeline(selected.id), getProject(selected.id), listDeployments(selected.id), getReleaseWorkflow(selected.id),
-      ])
-      setPipeline(steps); setSelected(fresh); setDeployments(deps); setReleaseWorkflow(workflow)
-      log('Kubernetes', 'Rolled back to BLUE')
-    } catch (err) {
-      setError(err instanceof Error ? err.message : 'Rollback failed')
-    } finally {
-      setRollingBack(false)
+      setDeployingProd(false)
     }
   }
 
@@ -584,7 +568,13 @@ export default function App() {
     status?: string; target?: string; preview_path?: string; entrypoint?: string | null; summary?: string
     checks?: Array<{ name: string; status: string; message: string }>
   } | undefined
+  const detectedServices = Array.isArray(analysis?.detected_services)
+    ? analysis.detected_services.join(', ')
+    : Array.isArray(analysis?.analysis_result?.detected_services)
+      ? (analysis.analysis_result.detected_services as string[]).join(', ')
+      : 'backend, frontend'
   const latestDeployment = deployments[0]
+  const latestDeploymentImage = (latestDeployment?.details as { image?: string } | null)?.image
   const smokeResult = (latestDeployment?.details as { smoke?: Record<string, unknown> } | null)?.smoke
   const remoteApplicationUrl = typeof smokeResult?.url === 'string' ? smokeResult.url : null
   const failureAnalysis = (latestDeployment?.details as { failure_analysis?: Record<string, unknown> } | null)?.failure_analysis
@@ -608,7 +598,7 @@ export default function App() {
   ]
 
   return (
-    <div className="flex h-screen overflow-hidden bg-zinc-950 text-zinc-200 font-mono">
+    <div className="flex h-screen overflow-hidden bg-zinc-950 text-zinc-200 font-sans">
       {/* ── Sidebar ── */}
       <aside className="flex w-52 shrink-0 flex-col border-r border-zinc-800 bg-zinc-900">
         {/* Brand */}
@@ -725,15 +715,6 @@ export default function App() {
                 >
                   {deploying ? 'Deploying…' : 'Deploy Staging'}
                 </button>
-                {selected.status === 'staging_healthy' && deploymentTarget === 'local' && systemStatus?.deployment_target === 'local' && (
-                  <button
-                    onClick={() => deployProduction(selected.id)}
-                    disabled={deployingProd || busy}
-                    className="rounded bg-emerald-700 px-3 py-1 text-xs font-medium text-white hover:bg-emerald-600 disabled:opacity-50"
-                  >
-                    Deploy Production
-                  </button>
-                )}
               </>
             )}
           </div>
@@ -956,6 +937,12 @@ export default function App() {
                 <p className="text-sm text-zinc-500">Workflow history is unavailable. Refresh the project to load persisted pipeline and deployment records.</p>
               ) : (
                 <>
+                  {releaseWorkflow.release.status === 'staging_healthy' && deploymentTarget === 'local' && systemStatus?.deployment_target === 'local' && (
+                    <div className="flex flex-wrap items-center justify-between gap-3 rounded border border-sky-800/40 bg-sky-950/20 p-4">
+                      <div><div className="text-sm font-medium text-sky-200">Staging verified</div><p className="mt-1 text-xs text-zinc-400">Request manager review for this release. Production will not start until a manager decision is recorded.</p></div>
+                      <button onClick={onRequestReleaseApproval} disabled={deployingProd} className="rounded bg-sky-700 px-4 py-2 text-xs font-medium text-white hover:bg-sky-600 disabled:opacity-50">{deployingProd ? 'Requesting…' : 'Request production approval'}</button>
+                    </div>
+                  )}
                   <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-4">
                     {[
                       ['Repository', releaseWorkflow.release.repository_name],
@@ -1352,7 +1339,7 @@ export default function App() {
                   </div>
 
                   {aiTests && (
-                    <div className="space-y-4">
+                    <div className="space-y-3">
                       <div className={`flex items-center gap-3 rounded border px-4 py-3 text-xs ${
                         aiTests.status === 'passed' ? 'border-emerald-700/50 bg-emerald-950/20' :
                         aiTests.status === 'skipped' ? 'border-zinc-700 bg-zinc-900/60' :
@@ -1367,6 +1354,10 @@ export default function App() {
                         <span className="text-zinc-300 font-medium">{aiTests.message}</span>
                         {aiTests.command && <span className="ml-auto text-zinc-500 font-mono text-[11px]">{aiTests.command}</span>}
                       </div>
+
+                      <details className="rounded border border-zinc-800 px-3 py-2">
+                        <summary className="cursor-pointer text-xs text-zinc-400">Technical test details</summary>
+                        <div className="mt-3 space-y-4">
 
                       {/* Test Inferences */}
                       {aiTests.test_inferences && aiTests.test_inferences.length > 0 && (
@@ -1448,6 +1439,8 @@ export default function App() {
                           </div>
                         </div>
                       )}
+                        </div>
+                      </details>
                     </div>
                   )}
                 </>
@@ -1493,9 +1486,7 @@ export default function App() {
                           {latestDeployment.status}
                         </span>
                         <span className="text-zinc-500">{latestDeployment.environment} / {latestDeployment.version}</span>
-                        {(latestDeployment.details as { image?: string } | null)?.image && (
-                          <span className="font-mono text-zinc-400">{(latestDeployment.details as { image?: string })!.image}</span>
-                        )}
+                        {latestDeploymentImage && <span className="font-mono text-zinc-400">{latestDeploymentImage}</span>}
                       </div>
                     </div>
                   )}
@@ -1569,12 +1560,7 @@ export default function App() {
                       <div>
                         <div className="font-medium text-sky-300">Multi-Service Architecture Detected</div>
                         <p className="text-zinc-400 text-[11px] mt-0.5 leading-relaxed">
-                          This project includes both backend and frontend components ({
-                            analysis?.detected_services?.join(', ') ||
-                            (Array.isArray(analysis?.analysis_result?.detected_services)
-                              ? (analysis?.analysis_result?.detected_services as string[]).join(', ')
-                              : 'backend, frontend')
-                          }).
+                          This project includes both backend and frontend components ({detectedServices}).
                           CodeDeck containerizes and deploys the core <strong>{analysis?.framework || 'backend'}</strong> service to Kubernetes.
                           The live API, health probes, and documentation are accessible below.
                         </p>
@@ -1617,47 +1603,6 @@ export default function App() {
                     </div>
                   )}
 
-                  {/* Blue-Green Zero-Downtime Deployment Lifecycle Guide */}
-                  <div className="rounded border border-zinc-800 bg-zinc-900/60 p-4">
-                    <div className="flex items-center justify-between mb-2.5">
-                      <div className="text-xs font-semibold uppercase tracking-wider text-zinc-300">
-                        Blue-Green Deployment Workflow
-                      </div>
-                      <span className="rounded bg-sky-950/60 border border-sky-800/50 px-2 py-0.5 text-[10px] text-sky-300 font-medium">
-                        Zero Downtime Strategy
-                      </span>
-                    </div>
-                    <div className="grid grid-cols-1 md:grid-cols-3 gap-3 text-xs">
-                      <div className={`rounded border p-3 ${selected.status.startsWith('staging') ? 'border-sky-500/40 bg-sky-950/30' : 'border-zinc-800 bg-zinc-950/40'}`}>
-                        <div className="font-semibold text-sky-400 mb-1 flex items-center justify-between">
-                          <span>1. Staging (BLUE)</span>
-                          {selected.status === 'staging_healthy' && <span className="text-[10px] text-emerald-400 font-normal">Active</span>}
-                        </div>
-                        <p className="text-zinc-400 text-[11px] leading-relaxed">
-                          Rolls out to an isolated staging deployment. Verifies readiness probes and runs automated HTTP smoke tests before touching production.
-                        </p>
-                      </div>
-                      <div className={`rounded border p-3 ${selected.status === 'production_awaiting_approval' ? 'border-amber-500/40 bg-amber-950/30' : 'border-zinc-800 bg-zinc-950/40'}`}>
-                        <div className="font-semibold text-emerald-400 mb-1 flex items-center justify-between">
-                          <span>2. Production (GREEN)</span>
-                          {selected.status === 'production_awaiting_approval' && <span className="text-[10px] text-amber-300 font-normal">Awaiting Review</span>}
-                        </div>
-                        <p className="text-zinc-400 text-[11px] leading-relaxed">
-                          Spins up the new release alongside existing production. Live user traffic remains untouched while you test the GREEN version safely.
-                        </p>
-                      </div>
-                      <div className={`rounded border p-3 ${selected.status === 'production_healthy' ? 'border-emerald-500/40 bg-emerald-950/30' : 'border-zinc-800 bg-zinc-950/40'}`}>
-                        <div className="font-semibold text-purple-400 mb-1 flex items-center justify-between">
-                          <span>3. Traffic Switch & Rollback</span>
-                          {selected.status === 'production_healthy' && <span className="text-[10px] text-emerald-400 font-normal">Live</span>}
-                        </div>
-                        <p className="text-zinc-400 text-[11px] leading-relaxed">
-                          Approval flips the service selector to route 100% of live traffic to GREEN instantly. Automated 1-click rollback to BLUE is always available.
-                        </p>
-                      </div>
-                    </div>
-                  </div>
-
                   {/* Deploy controls */}
                   <div className="flex flex-wrap gap-3 items-center">
                     <button
@@ -1676,16 +1621,7 @@ export default function App() {
                         {cancelingStaging || selected.status === 'staging_cancel_requested' ? 'Canceling Staging…' : 'Cancel Staging'}
                       </button>
                     )}
-                    {selected.status === 'staging_healthy' && deploymentTarget === 'local' && systemStatus?.deployment_target === 'local' && (
-                      <button
-                        onClick={() => { setDeployingProd(true); deployProduction(selected.id).finally(() => { setDeployingProd(false); loadProject(selected) }) }}
-                        disabled={deployingProd}
-                        className="rounded bg-emerald-700 px-4 py-2 text-xs font-medium text-white hover:bg-emerald-600 disabled:opacity-50 transition-colors"
-                      >
-                        {deployingProd ? 'Deploying GREEN…' : 'Deploy Production (GREEN)'}
-                      </button>
-                    )}
-                    {(deploymentTarget === 'local' && ['staging_healthy', 'production_awaiting_approval', 'production_healthy', 'rolled_back'].includes(selected.status)) && (
+                    {(deploymentTarget === 'local' && ['staging_healthy'].includes(selected.status)) && (
                       <a
                         href={`/api/projects/${selected.id}/preview/docs`}
                         target="_blank"
@@ -1700,12 +1636,6 @@ export default function App() {
                       <a href={remoteApplicationUrl} target="_blank" rel="noopener noreferrer" className="rounded bg-purple-700 px-4 py-2 text-xs font-medium text-white hover:bg-purple-600">
                         Open Deployed Application
                       </a>
-                    )}
-                    {deploymentTarget === 'remote' && selected.status === 'staging_healthy' && (
-                      <span className="text-[11px] text-zinc-500">Remote production blue-green controls are not available yet.</span>
-                    )}
-                    {deploymentTarget === 'local' && systemStatus?.deployment_target === 'remote' && selected.status === 'staging_healthy' && (
-                      <span className="text-[11px] text-zinc-500">Blue-green production controls require `DEPLOYMENT_TARGET=local` on the backend.</span>
                     )}
                   </div>
 
@@ -1835,38 +1765,6 @@ export default function App() {
                     </section>
                   )}
 
-                  {/* Approval banner */}
-                  {deploymentTarget === 'local' && systemStatus?.deployment_target === 'local' && selected.status === 'production_awaiting_approval' && (
-                    <div className="rounded border border-yellow-700/50 bg-yellow-950/30 p-4">
-                      <div className="text-sm font-medium text-yellow-300 mb-2">Production Approval Required</div>
-                      <p className="text-xs text-yellow-400 mb-3">GREEN version deployed and verified. Test via Live Preview, then approve to switch live traffic.</p>
-                      <div className="flex gap-3 items-center">
-                        <button
-                          onClick={onApprove}
-                          disabled={approvingProd}
-                          className="rounded bg-emerald-700 px-4 py-2 text-xs font-medium text-white hover:bg-emerald-600 disabled:opacity-50"
-                        >
-                          {approvingProd ? 'Switching…' : 'Approve Production'}
-                        </button>
-                        <button
-                          onClick={onRollback}
-                          disabled={rollingBack}
-                          className="rounded border border-red-700 px-4 py-2 text-xs text-red-400 hover:bg-red-950 disabled:opacity-50"
-                        >
-                          {rollingBack ? 'Rolling back…' : 'Rollback to BLUE'}
-                        </button>
-                        <a
-                          href={`/api/projects/${selected.id}/preview/docs`}
-                          target="_blank"
-                          rel="noopener noreferrer"
-                          className="text-xs text-yellow-300 underline hover:text-yellow-200 ml-2"
-                        >
-                          Test GREEN Preview ↗
-                        </a>
-                      </div>
-                    </div>
-                  )}
-
                   {/* Smoke test result & Live Endpoints */}
                   {smokeResult && (
                     <div className={`rounded border p-4 text-xs ${
@@ -1919,14 +1817,12 @@ export default function App() {
                       <div className="space-y-1.5">
                         {deployments.map(d => (
                           <div key={d.id} className="flex items-center gap-3 rounded border border-zinc-800 px-3 py-2 text-xs">
-                            <span className={`rounded px-1.5 py-0.5 text-[10px] font-bold ${
-                              d.version === 'green' ? 'bg-emerald-900 text-emerald-400' : 'bg-sky-900 text-sky-400'
-                            }`}>{d.version.toUpperCase()}</span>
+                            <span className="text-zinc-300 capitalize">{d.environment}</span>
+                            <span className="text-zinc-500">{d.deployment_type.replaceAll('_', ' ')}</span>
                             <span className="text-zinc-400 capitalize">{d.environment}</span>
                             <span className={`ml-auto font-semibold ${
-                              d.status === 'healthy' ? 'text-emerald-400' :
-                              d.status === 'failed' ? 'text-red-400' :
-                              d.status === 'awaiting_approval' ? 'text-yellow-400' : 'text-zinc-400'
+                              ['healthy', 'succeeded', 'SUCCEEDED'].includes(d.status) ? 'text-emerald-400' :
+                              ['failed', 'FAILED'].includes(d.status) ? 'text-red-400' : 'text-zinc-400'
                             }`}>{d.status}</span>
                             <span className="text-zinc-600">{new Date(d.created_at).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}</span>
                           </div>

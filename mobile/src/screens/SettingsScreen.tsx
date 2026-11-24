@@ -15,7 +15,7 @@ export default function SettingsScreen() {
     <PageTitle title="Settings" subtitle="Connect this manager app to the shared CodeDeck API." />
     <Panel style={styles.panel}><Text style={styles.heading}>Backend connection</Text><Text style={styles.body}>Use a server address reachable from this device. This value is kept in memory for the current app session; configure EXPO_PUBLIC_API_BASE_URL for a fixed development endpoint.</Text><Field value={url} onChangeText={setUrl} placeholder="https://codedeck.example.com" /><ActionButton title="Use this backend" onPress={save} /></Panel>
     <Panel style={styles.auth}><Text style={styles.authTitle}>Authentication status · Not configured</Text><Text style={styles.body}>{AUTH_NOT_CONFIGURED}</Text><Text style={styles.body}>The current backend accepts a shared release-approval service token and caller-supplied identity labels. Neither verifies a manager account. The app deliberately does not request, save or package that backend secret.</Text></Panel>
-    <Panel style={styles.panel}><Text style={styles.heading}>Notifications</Text><Text style={styles.body}>In-app activity is available from persisted monitoring events. Push notifications require notification infrastructure and are not enabled.</Text></Panel>
+    <Panel style={styles.panel}><Text style={styles.heading}>Notifications</Text><Text style={styles.body}>While this app is open, it checks for new approval requests every 30 seconds and shows an in-app alert and inbox banner. OS push notifications are not enabled because CodeDeck has no push delivery service.</Text></Panel>
     <Text style={styles.version}>CodeDeck Manager · 0.1.0</Text>
   </ScrollView>;
 }

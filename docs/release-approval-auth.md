@@ -1,9 +1,13 @@
-# Release approval API security
+# Release approval API security and local demo
 
 The shared FastAPI backend exposes release approval endpoints for a separate manager client. Configure `RELEASE_APPROVAL_TOKEN` with a high-entropy secret in the backend's secret store. Approval reads and decisions require `Authorization: Bearer <token>`. When the setting is empty, those endpoints return `503` and cannot accept decisions.
+
+For a local development demonstration only, approval reads and decisions can be enabled without a token by setting all of `CODEDECK_ENV=development`, `DEPLOYMENT_TARGET=local`, and `RELEASE_APPROVAL_DEMO_MODE=true`. The default is disabled. If any guard differs, approval endpoints return `503`. Demo decisions persist in the existing approval history with the fixed actor `Demo Manager (demo)`, a visible `[DEMO MODE]` comment, and `identity_verified=false`. An approved demo release stops at `Approved`: the backend does not enqueue a production deployment, access Kubernetes, or claim a real manager identity. Turn the flag back off after the demonstration. Never enable this mode in a reachable shared or production environment.
+
+To run this mode with the existing Compose setup, set those three values in your private local `.env` file (do not commit it) and restart only the backend. Use a local test project with a successfully completed staging deployment and recorded passing smoke test. The mobile inbox displays a persistent local-demo banner. On a device, point `EXPO_PUBLIC_API_BASE_URL` at the host's reachable backend address.
 
 CodeDeck currently has no end-user authentication, identity provider integration, or manager role authorization. `X-Approver-Identity` and `X-Requester-Identity` are caller-supplied audit labels, not verified identities; persisted records explicitly mark them unverified. The shared token identifies access to the approval API, not a human approver. Do not embed this token in a distributed mobile application. Until real user authentication and per-user authorization are added, expose approval APIs only through a trusted server-side gateway that authenticates managers and securely injects the token. The backend itself cannot distinguish managers from other holders of the shared token.
 
 Each request, decision, and production transition is persisted in `release_approval_events`. Project deletion is blocked when approval history exists so audit records are retained. The legacy project production-approve endpoint is disabled and cannot switch traffic.
 
-The current production blue-green workflow operates on local Kind only. Remote EC2/K3s production rollout and promotion are not implemented; remote approval submission and approval decisions are consequently unavailable while the backend is configured for remote production.
+Remote EC2/K3s production rollout and promotion are not implemented; production approval requests are consequently unavailable while the backend is configured for remote production. The old project production-approve endpoint is disabled; approval is recorded only through the audited release approval routes.

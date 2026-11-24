@@ -22,6 +22,7 @@ from app.core.prompts import (
     TEST_GENERATION_PROMPT,
 )
 from app.services.dependency_sanitizer import sanitize_requirements_file
+from app.services.repository_env import is_sensitive_environment_key, repository_child_environment
 from app.services.github import cleanup_repository, clone_repository
 from app.services.observability import (
     measure_operation,
@@ -120,7 +121,6 @@ SKIP_DIRS = {
     ".idea",
     ".vscode",
 }
-TEST_BLOCKED_ENV = {"OPENAI_API_KEY", "GROK_API_KEY", "XAI_API_KEY", "GITHUB_TOKEN", "GHCR_TOKEN"}
 
 
 class RepositoryChunk(BaseModel):
@@ -1259,7 +1259,7 @@ def client():
 
 
 def _child_env(extra_env: dict[str, str] | None = None) -> dict[str, str]:
-    env = {k: v for k, v in os.environ.items() if k not in TEST_BLOCKED_ENV}
+    env = repository_child_environment()
     mock_defaults = {
         "TESTING": "True",
         "ENVIRONMENT": "test",
@@ -1280,7 +1280,7 @@ def _child_env(extra_env: dict[str, str] | None = None) -> dict[str, str]:
         if k not in env:
             env[k] = v
     if extra_env:
-        env.update(extra_env)
+        env.update({k: v for k, v in extra_env.items() if not is_sensitive_environment_key(k)})
     return env
 
 

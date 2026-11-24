@@ -26,10 +26,12 @@ class Settings(BaseSettings):
     k8s_namespace: str = "deploymind"
     kubeconfig: str = ""
     deployment_target: Literal["remote", "local"] = "remote"
+    codedeck_environment: Literal["development", "test", "production"] = Field(default="production", validation_alias="CODEDECK_ENV")
     local_kind_enabled: bool = False
     remote_worker_url: str = ""
     remote_worker_token: str = ""
     release_approval_token: str = ""
+    release_approval_demo_mode: bool = False
     worker_id: str = "codedeck-worker"
     worker_poll_interval: int = Field(default=5, ge=1, le=60)
     worker_heartbeat_interval: int = Field(default=15, ge=5, le=300)

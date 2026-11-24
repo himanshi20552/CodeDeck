@@ -1,11 +1,11 @@
 import logging
-import os
 import re
 import subprocess
 from pathlib import Path
 
 from pydantic import BaseModel
 from app.services.dependency_sanitizer import sanitize_requirements_file
+from app.services.repository_env import repository_child_environment
 
 logger = logging.getLogger("deploymind")
 
@@ -22,7 +22,6 @@ ALLOWED_COMMANDS = [
 ]
 
 DEFAULT_TIMEOUT = 180
-BLOCKED_ENV = {"OPENAI_API_KEY", "GITHUB_TOKEN", "GHCR_TOKEN", "DATABASE_URL"}
 
 
 class TestResult(BaseModel):
@@ -41,7 +40,7 @@ def _is_allowed(command: str) -> bool:
 
 
 def _child_env() -> dict[str, str]:
-    return {k: v for k, v in os.environ.items() if k not in BLOCKED_ENV}
+    return repository_child_environment()
 
 
 def _run(command: str, cwd: Path, timeout: int) -> subprocess.CompletedProcess[str]:

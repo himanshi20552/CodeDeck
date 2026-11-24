@@ -31,13 +31,15 @@ Run the TypeScript check with `npm run typecheck`.
 
 - **Manager dashboard:** live project records, workflow status and elapsed time from `/api/projects` and `/api/projects/{id}/workflow`.
 - **Projects and project details:** persisted release workflow, repository snapshot/change summary, analysis results and deployment history.
-- **Approval inbox and release review:** uses Phase 5 `/api/approvals/pending` and `/api/approvals/{id}` and displays the persisted review summary.
-- **Approval actions:** posts the confirmed decision to `/api/approvals/{id}/approve` or `/reject`; server responses and errors are shown. Decisions are unavailable until real manager authentication is connected.
+- **Approval inbox and release review:** uses Phase 5 `/api/approvals/pending`, `/api/approvals/{id}` and `/api/approvals/history` and displays persisted release data.
+- **Approval actions:** asks for confirmation, requires a reason to reject, posts to `/api/approvals/{id}/approve` or `/reject`, then displays the backend response. The app never supplies a shared backend credential.
 - **Deployment monitoring:** reads `/api/monitoring`, including reported rollout, pod, HPA, metrics, health and alerts data. Missing metrics are shown as unavailable.
-- **Activity:** displays persisted monitoring alerts, deployment events and file activity. It is an in-app feed; push notifications are not configured.
+- **Activity:** displays persisted monitoring alerts, deployment events, file activity and approval history. While the app is foregrounded, it polls for pending approvals every 30 seconds and shows an in-app alert plus an inbox banner; OS push notifications are not configured.
 
 ## Authentication status
 
-The current backend has no end-user or manager identity provider. Phase 5 approval reads/decisions require a shared `RELEASE_APPROVAL_TOKEN`, while approver identity is a caller-supplied, explicitly unverified label. That backend credential is a server secret and **must not be included in this app, an Expo public environment variable, or a distributed mobile binary**. This client includes an authentication adapter seam (`src/api/auth.ts`) for a future OIDC/JWT session provider; no fake login or locally assigned role is used. Until the backend supports real user authentication and authorization, approval requests cannot be read or submitted from this app.
+The current backend has no end-user or manager identity provider. In normal mode, approval reads/decisions require a shared `RELEASE_APPROVAL_TOKEN`, while approver identity is a caller-supplied, explicitly unverified label. That backend credential is a server secret and **must not be included in this app, an Expo public environment variable, or a distributed mobile binary**. This client includes an authentication adapter seam (`src/api/auth.ts`) for a future OIDC/JWT session provider; no fake login or locally assigned role is used.
+
+For a local demonstration, the backend may enable `RELEASE_APPROVAL_DEMO_MODE=true` only alongside `CODEDECK_ENV=development` and `DEPLOYMENT_TARGET=local`. The inbox labels this mode. Approval/rejection events are persisted with the fixed identity `Demo Manager (demo)`, marked unverified, and do not enqueue production deployment. See `docs/release-approval-auth.md`; never enable this mode on a shared or production server. With demo mode off and no real user session, the backend denies approval access and the app shows the actual API error.
 
 The API client currently calls project, workflow, analysis, deployment and monitoring reads that the existing backend exposes without user authentication. Deploy this mobile app only in an environment where those backend endpoints are appropriately protected at the network/gateway boundary.

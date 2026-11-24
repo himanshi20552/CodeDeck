@@ -43,17 +43,17 @@ export const api = {
   workflow: (projectId: number) => request<import("../types").Workflow>(`/api/projects/${projectId}/workflow`),
   analysis: (projectId: number) => request<Record<string, any> | null>(`/api/projects/${projectId}/analysis`),
   deployments: (projectId: number) => request<import("../types").Deployment[]>(`/api/projects/${projectId}/deployments`),
-  pendingApprovals: () => request<{ items: import("../types").Approval[]; count: number }>("/api/approvals/pending", {}, true),
-  approvalHistory: () => request<{ items: import("../types").Approval[]; count: number }>("/api/approvals/history", {}, true),
-  approval: (approvalId: number) => request<import("../types").Approval>(`/api/approvals/${approvalId}`, {}, true),
+  pendingApprovals: async () => request<{ items: import("../types").Approval[]; count: number; mode?: "demo" | "token" }>("/api/approvals/pending", {}, Boolean((await getAuthSession())?.accessToken)),
+  approvalHistory: async () => request<{ items: import("../types").Approval[]; count: number; mode?: "demo" | "token" }>("/api/approvals/history", {}, Boolean((await getAuthSession())?.accessToken)),
+  approval: async (approvalId: number) => request<import("../types").Approval>(`/api/approvals/${approvalId}`, {}, Boolean((await getAuthSession())?.accessToken)),
   decide: async (approvalId: number, decision: "approve" | "reject", comments: string) => {
     const session = await getAuthSession();
-    if (!session?.accessToken || !session.approverIdentity) throw new Error(AUTH_NOT_CONFIGURED);
+    if (session?.accessToken && !session.approverIdentity) throw new Error(AUTH_NOT_CONFIGURED);
     return request<import("../types").Approval>(`/api/approvals/${approvalId}/${decision}`, {
       method: "POST",
-      headers: { "X-Approver-Identity": session.approverIdentity },
+      headers: session?.approverIdentity ? { "X-Approver-Identity": session.approverIdentity } : {},
       body: JSON.stringify({ comments: comments || null }),
-    }, true, session);
+    }, Boolean(session?.accessToken), session || undefined);
   },
   monitoring: (projectId?: number) => request<import("../types").Monitoring>(`/api/monitoring${projectId ? `?project_id=${projectId}` : ""}`),
 };

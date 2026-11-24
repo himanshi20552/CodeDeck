@@ -24,7 +24,15 @@ class DecisionRequest(BaseModel):
     comments: str | None = Field(default=None, max_length=4000)
 
 
-def _manager_read_auth(authorization: str | None) -> None:
+def _demo_mode_enabled() -> bool:
+    return settings.release_approval_demo_mode and settings.codedeck_environment == "development" and settings.deployment_target == "local"
+
+
+def _manager_read_auth(authorization: str | None) -> str:
+    if settings.release_approval_demo_mode:
+        if not _demo_mode_enabled():
+            raise HTTPException(status_code=503, detail="Approval demo mode is blocked unless CODEDECK_ENV=development and DEPLOYMENT_TARGET=local")
+        return "demo"
     expected = settings.release_approval_token
     supplied = ""
     if authorization:
@@ -32,17 +40,20 @@ def _manager_read_auth(authorization: str | None) -> None:
         if scheme.lower() == "bearer":
             supplied = value.strip()
     if not expected:
-        raise HTTPException(status_code=503, detail="Release approval is unavailable until RELEASE_APPROVAL_TOKEN is configured")
+        raise HTTPException(status_code=503, detail="Release approval requires configured authentication or the explicitly enabled local development demo mode")
     if not supplied or not hmac.compare_digest(supplied, expected):
         raise HTTPException(status_code=401, detail="Release approval authentication failed")
+    return "token"
 
 
-def _manager_decision_auth(authorization: str | None, identity: str | None) -> str:
-    _manager_read_auth(authorization)
+def _manager_decision_auth(authorization: str | None, identity: str | None) -> tuple[str, bool]:
+    mode = _manager_read_auth(authorization)
+    if mode == "demo":
+        return "Demo Manager (demo)", True
     actor = (identity or "").strip()
     if len(actor) < 2 or len(actor) > 255:
         raise HTTPException(status_code=422, detail="X-Approver-Identity must contain 2–255 characters")
-    return actor
+    return actor, False
 
 
 def _deployment_summary(row: Deployment | None) -> dict | None:
@@ -62,6 +73,7 @@ def _approval_detail(db: Session, approval: ReleaseApproval) -> dict:
     staging = db.get(Deployment, approval.staging_deployment_id) if approval.staging_deployment_id else None
     production = db.get(Deployment, approval.production_deployment_id) if approval.production_deployment_id else None
     events = db.query(ReleaseApprovalEvent).filter(ReleaseApprovalEvent.approval_id == approval.id).order_by(ReleaseApprovalEvent.id.asc()).all()
+    demo_mode = _demo_mode_enabled() or any(bool((event.details or {}).get("demo_mode")) for event in events)
     return {"id": approval.id, "project_id": approval.project_id,
             "project": {"id": project.id, "name": project.repository_name, "repository_url": project.repository_url} if project else None,
             "status": approval.status, "release_version": approval.release_version, "branch": approval.branch,
@@ -70,7 +82,7 @@ def _approval_detail(db: Session, approval: ReleaseApproval) -> dict:
             "requested_at": approval.requested_at.isoformat() if approval.requested_at else None,
             "approver_identity": approval.approver_identity, "approver_identity_verified": approval.approver_identity_verified,
             "decision": approval.decision, "decision_timestamp": approval.decision_timestamp.isoformat() if approval.decision_timestamp else None,
-            "comments": approval.comments, "summary": approval.release_summary or {},
+            "comments": approval.comments, "summary": approval.release_summary or {}, "demo_mode": demo_mode,
             "staging_deployment": _deployment_summary(staging), "production_deployment": _deployment_summary(production),
             "events": [{"id": event.id, "event_type": event.event_type, "from_status": event.from_status,
                         "to_status": event.to_status, "actor_identity": event.actor_identity,
@@ -113,20 +125,20 @@ def submit_approval_request(project_id: int, body: ApprovalRequest,
 
 @router.get("/approvals/pending")
 def list_pending_approvals(authorization: str | None = Header(default=None), db: Session = Depends(get_db)):
-    _manager_read_auth(authorization)
+    mode = _manager_read_auth(authorization)
     rows = db.query(ReleaseApproval).filter(ReleaseApproval.status == "Awaiting Approval").order_by(ReleaseApproval.requested_at.asc(), ReleaseApproval.id.asc()).all()
-    return {"items": [_approval_detail(db, row) for row in rows], "count": len(rows)}
+    return {"items": [_approval_detail(db, row) for row in rows], "count": len(rows), "mode": mode}
 
 
 @router.get("/approvals/history")
 def approval_history(project_id: int | None = None, limit: int = Query(default=100, ge=1, le=500),
                      authorization: str | None = Header(default=None), db: Session = Depends(get_db)):
-    _manager_read_auth(authorization)
+    mode = _manager_read_auth(authorization)
     query = db.query(ReleaseApproval)
     if project_id is not None:
         query = query.filter(ReleaseApproval.project_id == project_id)
     rows = query.order_by(ReleaseApproval.created_at.desc(), ReleaseApproval.id.desc()).limit(limit).all()
-    return {"items": [_approval_detail(db, row) for row in rows], "count": len(rows)}
+    return {"items": [_approval_detail(db, row) for row in rows], "count": len(rows), "mode": mode}
 
 
 @router.get("/approvals/{approval_id}")
@@ -140,16 +152,23 @@ def get_approval(approval_id: int, authorization: str | None = Header(default=No
 
 def _decision(approval_id: int, decision: str, body: DecisionRequest, background_tasks: BackgroundTasks,
               authorization: str | None, approver_identity: str | None, db: Session) -> dict:
-    actor = _manager_decision_auth(authorization, approver_identity)
+    actor, demo_mode = _manager_decision_auth(authorization, approver_identity)
     approval = db.query(ReleaseApproval).filter(ReleaseApproval.id == approval_id).with_for_update().first()
     if approval is None:
         raise HTTPException(status_code=404, detail="Approval request not found")
     if decision == "approved":
-        _ensure_production_available()
+        if not demo_mode:
+            _ensure_production_available()
+    if decision == "rejected" and not (body.comments and body.comments.strip()):
+        raise HTTPException(status_code=422, detail="A reason is required to reject a release")
     try:
-        approval = decide_release(db, approval_id, decision=decision, approver_identity=actor, comments=body.comments)
+        approval = decide_release(db, approval_id, decision=decision, approver_identity=actor, comments=body.comments, demo_mode=demo_mode)
         project = db.get(Project, approval.project_id)
-        if decision == "approved":
+        if demo_mode:
+            # Demo approval is a persisted review decision only. No Kubernetes
+            # or worker operation is enqueued from the unauthenticated demo.
+            pass
+        elif decision == "approved":
             if project:
                 project.status = "production_deploying"
             upsert_step(db, approval.project_id, "Production", "running", result=f"Release approved by {actor}; production rollout queued")
@@ -164,11 +183,13 @@ def _decision(approval_id: int, decision: str, body: DecisionRequest, background
     except ValueError as exc:
         db.rollback()
         raise HTTPException(status_code=409, detail=str(exc)) from exc
-    if decision == "approved":
+    if decision == "approved" and not demo_mode:
         from app.api.deployments import _bg_deploy_production
         background_tasks.add_task(_bg_deploy_production, approval.project_id, approval.id)
     db.refresh(approval)
-    return _approval_detail(db, approval)
+    response = _approval_detail(db, approval)
+    response["demo_mode"] = demo_mode
+    return response
 
 
 @router.post("/approvals/{approval_id}/approve")

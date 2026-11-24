@@ -13,8 +13,8 @@ export default function ProjectsScreen({ onProject }: { onProject: (project: Pro
     {loading ? <LoadingState /> : error ? <MessageState title="Projects unavailable" detail={error} action={<Text onPress={refresh} style={styles.link}>Try again</Text>} /> : null}
     {!loading && !error && !data?.length ? <MessageState title="No projects registered" detail="New projects connected through the developer application will appear here." /> : null}
     {data?.map((project) => <Pressable key={project.id} onPress={() => onProject(project)} style={({ pressed }) => [styles.item, pressed && { opacity: 0.82 }]}>
-      <View style={styles.row}><View style={{ flex: 1 }}><Text style={styles.name}>{project.repository_name}</Text><Text numberOfLines={1} style={styles.url}>{project.repository_url}</Text></View><StatusPill status={project.status.replaceAll("_", " ")} /></View>
-      <Text style={styles.meta}>Project {project.id} · Connected {new Date(project.created_at).toLocaleDateString()}</Text>
+      <View style={styles.row}><Text style={styles.name}>{project.repository_name}</Text><StatusPill status={project.status.replaceAll("_", " ")} /></View>
+      <Text style={styles.meta}>Connected {new Date(project.created_at).toLocaleDateString()}</Text>
       <Text style={styles.link}>View workflow  ›</Text>
     </Pressable>)}
   </ScrollView>;

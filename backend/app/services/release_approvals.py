@@ -152,7 +152,7 @@ def request_release_approval(db: Session, project: Project, staging: Deployment,
 
 
 def decide_release(db: Session, approval_id: int, *, decision: str, approver_identity: str,
-                   comments: str | None = None) -> ReleaseApproval:
+                   comments: str | None = None, demo_mode: bool = False) -> ReleaseApproval:
     if decision not in {"approved", "rejected"}:
         raise ValueError("Decision must be approved or rejected")
     approval = db.query(ReleaseApproval).filter(ReleaseApproval.id == approval_id).with_for_update().first()
@@ -160,6 +160,8 @@ def decide_release(db: Session, approval_id: int, *, decision: str, approver_ide
         raise LookupError("Approval request not found")
     if approval.status != "Awaiting Approval" or approval.decision is not None:
         raise ValueError(f"Decision is already completed or release is in state {approval.status}")
+    if decision == "rejected" and not (comments and comments.strip()):
+        raise ValueError("A rejection reason is required")
     staging = db.get(Deployment, approval.staging_deployment_id) if approval.staging_deployment_id else None
     if not staging or staging.project_id != approval.project_id:
         raise ValueError("The verified staging deployment is no longer available")
@@ -171,11 +173,16 @@ def decide_release(db: Session, approval_id: int, *, decision: str, approver_ide
     approval.approver_identity_verified = False
     approval.decision = decision
     approval.decision_timestamp = timestamp
-    approval.comments = comments[:4000] if comments else None
+    recorded_comments = comments.strip() if comments and comments.strip() else None
+    if demo_mode:
+        recorded_comments = f"[DEMO MODE] {recorded_comments}" if recorded_comments else "[DEMO MODE] Demonstration approval action."
+    approval.comments = recorded_comments[:4000] if recorded_comments else None
     to_status = "Approved" if decision == "approved" else "Rejected"
     transition_release(db, approval, to_status, event_type=f"approval_{decision}", actor_identity=approver_identity,
-                       comments=comments, details={"identity_verified": False, "smoke_test": smoke}, occurred_at=timestamp)
-    if decision == "approved":
+                       comments=recorded_comments, details={"identity_verified": False, "demo_mode": demo_mode, "smoke_test": smoke}, occurred_at=timestamp)
+    # A local demonstration records the manager decision, but never queues a
+    # production rollout. Demo identity is deliberately unverified.
+    if decision == "approved" and not demo_mode:
         transition_release(db, approval, "Production Deploying", event_type="production_deployment_queued",
                            actor_identity=approver_identity, comments="Production rollout queued after approval.",
                            details={"staging_deployment_id": staging.id})

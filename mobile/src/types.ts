@@ -66,6 +66,7 @@ export type Approval = {
   project_id: number;
   project?: { id: number; name: string; repository_url: string } | null;
   status: string;
+  demo_mode?: boolean;
   release_version?: string | null;
   branch?: string | null;
   commit_id?: string | null;

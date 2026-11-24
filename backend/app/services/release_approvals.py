@@ -180,7 +180,7 @@ def decide_release(db: Session, approval_id: int, *, decision: str, approver_ide
     to_status = "Approved" if decision == "approved" else "Rejected"
     transition_release(db, approval, to_status, event_type=f"approval_{decision}", actor_identity=approver_identity,
                        comments=recorded_comments, details={"identity_verified": False, "demo_mode": demo_mode, "smoke_test": smoke}, occurred_at=timestamp)
-    # A local demonstration records the manager decision, but never queues a
+    # A development demonstration records the manager decision, but never queues a
     # production rollout. Demo identity is deliberately unverified.
     if decision == "approved" and not demo_mode:
         transition_release(db, approval, "Production Deploying", event_type="production_deployment_queued",

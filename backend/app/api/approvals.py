@@ -25,13 +25,13 @@ class DecisionRequest(BaseModel):
 
 
 def _demo_mode_enabled() -> bool:
-    return settings.release_approval_demo_mode and settings.codedeck_environment == "development" and settings.deployment_target == "local"
+    return settings.release_approval_demo_mode and settings.codedeck_environment == "development"
 
 
 def _manager_read_auth(authorization: str | None) -> str:
     if settings.release_approval_demo_mode:
         if not _demo_mode_enabled():
-            raise HTTPException(status_code=503, detail="Approval demo mode is blocked unless CODEDECK_ENV=development and DEPLOYMENT_TARGET=local")
+            raise HTTPException(status_code=503, detail="Approval demo mode is blocked unless CODEDECK_ENV=development")
         return "demo"
     expected = settings.release_approval_token
     supplied = ""
@@ -73,7 +73,9 @@ def _approval_detail(db: Session, approval: ReleaseApproval) -> dict:
     staging = db.get(Deployment, approval.staging_deployment_id) if approval.staging_deployment_id else None
     production = db.get(Deployment, approval.production_deployment_id) if approval.production_deployment_id else None
     events = db.query(ReleaseApprovalEvent).filter(ReleaseApprovalEvent.approval_id == approval.id).order_by(ReleaseApprovalEvent.id.asc()).all()
-    demo_mode = _demo_mode_enabled() or any(bool((event.details or {}).get("demo_mode")) for event in events)
+    demo_mode = any(bool((event.details or {}).get("demo_mode")) for event in events)
+    if approval.decision is None and _demo_mode_enabled():
+        demo_mode = True
     return {"id": approval.id, "project_id": approval.project_id,
             "project": {"id": project.id, "name": project.repository_name, "repository_url": project.repository_url} if project else None,
             "status": approval.status, "release_version": approval.release_version, "branch": approval.branch,
@@ -100,7 +102,6 @@ def _ensure_production_available() -> None:
 def submit_approval_request(project_id: int, body: ApprovalRequest,
                             requester_identity: str | None = Header(default=None, alias="X-Requester-Identity"),
                             db: Session = Depends(get_db)):
-    _ensure_production_available()
     project = db.get(Project, project_id)
     if project is None:
         raise HTTPException(status_code=404, detail="Project not found")
@@ -167,7 +168,11 @@ def _decision(approval_id: int, decision: str, body: DecisionRequest, background
         if demo_mode:
             # Demo approval is a persisted review decision only. No Kubernetes
             # or worker operation is enqueued from the unauthenticated demo.
-            pass
+            if project:
+                project.status = "staging_healthy" if decision == "approved" else "release_rejected"
+            upsert_step(db, approval.project_id, "Production", "skipped" if decision == "approved" else "warning",
+                        result="Demo approval recorded; production promotion was not started" if decision == "approved"
+                        else "Release rejected in demo mode; production deployment was not started")
         elif decision == "approved":
             if project:
                 project.status = "production_deploying"

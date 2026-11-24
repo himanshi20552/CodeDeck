@@ -1,37 +1,132 @@
 @import "tailwindcss";
 
 @theme {
-  --font-sans: "IBM Plex Sans", ui-sans-serif, system-ui, sans-serif;
+  --font-sans: "IBM Plex Sans", Inter, ui-sans-serif, system-ui, sans-serif;
   --font-mono: "IBM Plex Mono", ui-monospace, monospace;
+}
+
+:root {
+  font-family: var(--font-sans);
+  color: #172b4d;
+  background: #f4f6f8;
+  font-synthesis: none;
+  text-rendering: optimizeLegibility;
+  -webkit-font-smoothing: antialiased;
+  --app-canvas: #f4f6f8;
+  --app-surface: #ffffff;
+  --app-subtle: #f8fafc;
+  --app-ink: #172b4d;
+  --app-secondary: #64748b;
+  --app-muted: #94a3b8;
+  --app-border: #e2e8f0;
+  --app-blue: #2457a7;
+  --app-blue-soft: #eaf1fb;
+  --app-teal: #117a72;
 }
 
 html,
 body,
 #root {
   height: 100%;
+  min-height: 100%;
   margin: 0;
   padding: 0;
   overflow: hidden;
-  background: #09090b;
-  color: #e4e4e7;
+  background: var(--app-canvas);
+  color: var(--app-ink);
   font-family: var(--font-sans);
 }
 
-* {
-  box-sizing: border-box;
+* { box-sizing: border-box; }
+
+button, input, select, textarea { font: inherit; }
+button { -webkit-tap-highlight-color: transparent; }
+:focus-visible { outline: 2px solid #6d9cdb; outline-offset: 2px; }
+
+::-webkit-scrollbar { width: 8px; height: 8px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb { background: #cbd5e1; border: 2px solid transparent; border-radius: 99px; background-clip: padding-box; }
+::-webkit-scrollbar-thumb:hover { background: #94a3b8; border: 2px solid transparent; background-clip: padding-box; }
+
+/* Keep the existing utility-based UI while moving its neutral palette to the
+   same light canvas and blue accents used by the manager app. */
+.codedeck-workspace { background: var(--app-canvas); color: var(--app-ink); }
+.codedeck-workspace [class~="bg-zinc-950"],
+.codedeck-workspace [class~="bg-zinc-950/70"],
+.codedeck-workspace [class~="bg-zinc-950/60"],
+.codedeck-workspace [class~="bg-zinc-950/50"],
+.codedeck-workspace [class~="bg-zinc-950/40"] { background-color: var(--app-subtle) !important; }
+.codedeck-workspace [class~="bg-zinc-900"],
+.codedeck-workspace [class~="bg-zinc-900/60"],
+.codedeck-workspace [class~="bg-zinc-900/50"],
+.codedeck-workspace [class~="bg-zinc-900/40"] { background-color: var(--app-surface) !important; }
+.codedeck-workspace [class~="bg-zinc-800"],
+.codedeck-workspace [class~="bg-zinc-800/80"],
+.codedeck-workspace [class~="bg-zinc-800/60"],
+.codedeck-workspace [class~="bg-zinc-800/50"] { background-color: #f1f5f9 !important; }
+.codedeck-workspace [class~="bg-zinc-700"] { background-color: #e2e8f0 !important; }
+
+.codedeck-workspace [class~="text-white"],
+.codedeck-workspace [class~="text-zinc-100"],
+.codedeck-workspace [class~="text-zinc-200"] { color: var(--app-ink) !important; }
+.codedeck-workspace [class~="text-zinc-300"],
+.codedeck-workspace [class~="text-zinc-400"] { color: var(--app-secondary) !important; }
+.codedeck-workspace [class~="text-zinc-500"],
+.codedeck-workspace [class~="text-zinc-600"],
+.codedeck-workspace [class~="text-zinc-700"] { color: var(--app-muted) !important; }
+.codedeck-workspace [class~="border-zinc-900"],
+.codedeck-workspace [class~="border-zinc-800"],
+.codedeck-workspace [class~="border-zinc-700"],
+.codedeck-workspace [class~="border-zinc-600"] { border-color: var(--app-border) !important; }
+.codedeck-workspace [class~="placeholder-zinc-600"]::placeholder { color: #94a3b8 !important; }
+.codedeck-workspace [class~="hover:bg-zinc-800"]:hover,
+.codedeck-workspace [class~="hover:bg-zinc-800/50"]:hover { background-color: #f1f5f9 !important; }
+.codedeck-workspace [class~="hover:text-zinc-200"]:hover,
+.codedeck-workspace [class~="hover:text-zinc-300"]:hover { color: var(--app-ink) !important; }
+
+/* Muted status colors stay legible on white surfaces. */
+.codedeck-workspace [class~="bg-emerald-950/20"], .codedeck-workspace [class~="bg-emerald-950/30"], .codedeck-workspace [class~="bg-emerald-950/40"] { background-color: #edf8f2 !important; }
+.codedeck-workspace [class~="bg-sky-950/20"], .codedeck-workspace [class~="bg-sky-950/30"], .codedeck-workspace [class~="bg-sky-950/40"] { background-color: var(--app-blue-soft) !important; }
+.codedeck-workspace [class~="bg-amber-950/20"], .codedeck-workspace [class~="bg-amber-950/30"], .codedeck-workspace [class~="bg-yellow-950/20"] { background-color: #fff7e8 !important; }
+.codedeck-workspace [class~="bg-red-950/20"], .codedeck-workspace [class~="bg-red-950/30"], .codedeck-workspace [class~="bg-red-950/40"] { background-color: #fff1f0 !important; }
+.codedeck-workspace [class~="bg-orange-950/20"] { background-color: #fff5eb !important; }
+.codedeck-workspace [class~="text-emerald-300"], .codedeck-workspace [class~="text-emerald-400"] { color: #16804a !important; }
+.codedeck-workspace [class~="text-sky-200"], .codedeck-workspace [class~="text-sky-300"], .codedeck-workspace [class~="text-sky-400"] { color: var(--app-blue) !important; }
+.codedeck-workspace [class~="text-amber-300"], .codedeck-workspace [class~="text-yellow-400"], .codedeck-workspace [class~="text-orange-300"] { color: #9a6700 !important; }
+.codedeck-workspace [class~="text-red-300"], .codedeck-workspace [class~="text-red-400"] { color: #bd3434 !important; }
+.codedeck-workspace [class~="border-emerald-700/50"], .codedeck-workspace [class~="border-emerald-800"], .codedeck-workspace [class~="border-emerald-900"] { border-color: #b6e1c7 !important; }
+.codedeck-workspace [class~="border-sky-700/50"], .codedeck-workspace [class~="border-sky-800"], .codedeck-workspace [class~="border-sky-800/40"] { border-color: #bed2ef !important; }
+.codedeck-workspace [class~="border-amber-800"], .codedeck-workspace [class~="border-amber-900/50"] { border-color: #f0d7a5 !important; }
+.codedeck-workspace [class~="border-red-700/50"], .codedeck-workspace [class~="border-red-800"], .codedeck-workspace [class~="border-red-900"] { border-color: #f0c4c1 !important; }
+.codedeck-workspace [class~="bg-sky-700"] { background-color: var(--app-blue) !important; }
+.codedeck-workspace [class~="hover:bg-sky-600"]:hover { background-color: #1d488a !important; }
+
+.codedeck-workspace [class*="rounded"]:not([class~="rounded-full"]) { border-radius: 6px; }
+.codedeck-workspace button { min-height: 34px; transition: background-color 140ms ease, border-color 140ms ease, color 140ms ease; }
+.codedeck-workspace button:disabled { cursor: not-allowed; }
+.codedeck-workspace input, .codedeck-workspace select, .codedeck-workspace textarea { color: var(--app-ink); }
+.codedeck-workspace details > summary { list-style-position: inside; }
+.codedeck-workspace details > summary:hover { color: var(--app-blue); }
+
+@media (max-width: 760px) {
+  .codedeck-workspace > aside { width: 3.75rem; }
+  .codedeck-workspace > aside > div:first-child { padding: 0.75rem 0.35rem; text-align: center; }
+  .codedeck-workspace > aside > div:first-child > div:first-child,
+  .codedeck-workspace > aside > div:first-child > div:last-child,
+  .codedeck-workspace > aside > div:nth-child(2) { display: none; }
+  .codedeck-workspace > aside nav button { justify-content: center; padding: 0.6rem 0.3rem; }
+  .codedeck-workspace > aside nav button { font-size: 0; }
+  .codedeck-workspace > aside nav button > span { font-size: 1.2rem; }
+  .codedeck-workspace > aside > div:last-child { padding: 0.75rem 0.25rem; }
+  .codedeck-workspace header { padding-left: 0.75rem; padding-right: 0.75rem; gap: 0.5rem; }
+  .codedeck-workspace header > div:last-child { flex-wrap: wrap; justify-content: flex-end; gap: 0.35rem; }
+  .codedeck-workspace header > div:last-child > div { flex-wrap: wrap; justify-content: flex-end; }
+  .codedeck-workspace main { padding: 1rem; }
 }
 
-::-webkit-scrollbar {
-  width: 4px;
-  height: 4px;
-}
-::-webkit-scrollbar-track {
-  background: transparent;
-}
-::-webkit-scrollbar-thumb {
-  background: #3f3f46;
-  border-radius: 2px;
-}
-::-webkit-scrollbar-thumb:hover {
-  background: #52525b;
+@media (max-width: 480px) {
+  .codedeck-workspace header > div:first-child { display: block; }
+  .codedeck-workspace header > div:last-child > span { display: none; }
+  .codedeck-workspace header button { padding: 0.35rem 0.45rem; font-size: 10px; }
+  .codedeck-workspace main { padding: 0.75rem; }
 }

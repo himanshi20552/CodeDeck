@@ -92,18 +92,16 @@ function friendlyError(message: string) {
 function Pill({ label, value }: { label: string; value: string | number | null | undefined }) {
   return (
     <div className="rounded border border-zinc-700 bg-zinc-800/60 px-3 py-2">
-      <div className="font-mono text-[10px] uppercase tracking-widest text-zinc-500">{label}</div>
-      <div className="mt-0.5 truncate font-mono text-sm text-zinc-200">{value ?? '—'}</div>
+      <div className="text-[10px] font-medium uppercase tracking-wide text-zinc-500">{label}</div>
+      <div className="mt-0.5 truncate text-sm font-medium text-zinc-200">{value ?? '—'}</div>
     </div>
   )
 }
 
 function SectionTitle({ children }: { children: React.ReactNode }) {
   return (
-    <h2 className="mb-4 flex items-center gap-2 text-xs font-semibold uppercase tracking-widest text-zinc-500">
-      <span className="h-px flex-1 bg-zinc-800" />
+    <h2 className="mb-3 text-sm font-semibold tracking-tight text-zinc-200">
       {children}
-      <span className="h-px flex-1 bg-zinc-800" />
     </h2>
   )
 }
@@ -598,7 +596,7 @@ export default function App() {
   ]
 
   return (
-    <div className="flex h-screen overflow-hidden bg-zinc-950 text-zinc-200 font-sans">
+    <div className="codedeck-workspace flex h-screen overflow-hidden bg-zinc-950 text-zinc-200 font-sans">
       {/* ── Sidebar ── */}
       <aside className="flex w-52 shrink-0 flex-col border-r border-zinc-800 bg-zinc-900">
         {/* Brand */}
@@ -638,6 +636,8 @@ export default function App() {
                   ? 'bg-zinc-800 text-white'
                   : 'text-zinc-500 hover:bg-zinc-800/50 hover:text-zinc-300'
               }`}
+              title={label}
+              aria-current={page === id ? 'page' : undefined}
             >
               <span className="text-base">{icon}</span>
               {label}
@@ -776,9 +776,9 @@ export default function App() {
               )}
 
               {selected && (
-                <>
-                  <SectionTitle>Pipeline Status</SectionTitle>
-                  <div className="space-y-1">
+                <details className="rounded border border-zinc-800 bg-zinc-900/40 p-4">
+                  <summary className="cursor-pointer text-sm font-semibold text-zinc-200">Pipeline status <span className="ml-2 text-xs font-normal text-zinc-500">View stage results</span></summary>
+                  <div className="mt-4 space-y-1">
                     {PIPELINE_STEPS.map(name => {
                       const step = pipelineMap[name]
                       const s = step?.status ?? 'pending'
@@ -797,7 +797,7 @@ export default function App() {
                       )
                     })}
                   </div>
-                </>
+                </details>
               )}
             </div>
           )}
@@ -937,7 +937,7 @@ export default function App() {
                 <p className="text-sm text-zinc-500">Workflow history is unavailable. Refresh the project to load persisted pipeline and deployment records.</p>
               ) : (
                 <>
-                  {releaseWorkflow.release.status === 'staging_healthy' && deploymentTarget === 'local' && systemStatus?.deployment_target === 'local' && (
+                  {releaseWorkflow.release.status === 'staging_healthy' && deploymentTarget === systemStatus?.deployment_target && (
                     <div className="flex flex-wrap items-center justify-between gap-3 rounded border border-sky-800/40 bg-sky-950/20 p-4">
                       <div><div className="text-sm font-medium text-sky-200">Staging verified</div><p className="mt-1 text-xs text-zinc-400">Request manager review for this release. Production will not start until a manager decision is recorded.</p></div>
                       <button onClick={onRequestReleaseApproval} disabled={deployingProd} className="rounded bg-sky-700 px-4 py-2 text-xs font-medium text-white hover:bg-sky-600 disabled:opacity-50">{deployingProd ? 'Requesting…' : 'Request production approval'}</button>
@@ -1013,10 +1013,13 @@ export default function App() {
                             <span>·</span><span>Modified: {releaseWorkflow.repository_snapshot.modified.length}</span>
                             <span>·</span><span>Deleted: {releaseWorkflow.repository_snapshot.deleted.length}</span>
                           </div>
-                          <div className="max-h-72 overflow-auto rounded border border-zinc-800 bg-zinc-950/70">
-                            {releaseWorkflow.repository_snapshot.files.map(path => <div key={path} className="border-b border-zinc-900 px-3 py-1.5 font-mono text-[10px] text-zinc-300">{path}</div>)}
-                            {releaseWorkflow.repository_snapshot.files.length === 0 && <div className="p-3 text-xs text-zinc-600">No tracked file inventory was captured.</div>}
-                          </div>
+                          <details>
+                            <summary className="cursor-pointer text-xs text-zinc-500">Show discovered files ({releaseWorkflow.repository_snapshot.files.length})</summary>
+                            <div className="mt-2 max-h-72 overflow-auto rounded border border-zinc-800 bg-zinc-950/70">
+                              {releaseWorkflow.repository_snapshot.files.map(path => <div key={path} className="border-b border-zinc-900 px-3 py-1.5 font-mono text-[10px] text-zinc-300">{path}</div>)}
+                              {releaseWorkflow.repository_snapshot.files.length === 0 && <div className="p-3 text-xs text-zinc-600">No tracked file inventory was captured.</div>}
+                            </div>
+                          </details>
                           <p className="mt-3 text-[10px] text-zinc-600">No stage-to-file impact mapping is persisted. Change comparisons are not inferred from file paths.</p>
                         </>
                       ) : <p className="text-xs text-zinc-600">No Git snapshot metadata is stored for this analysis.</p>}

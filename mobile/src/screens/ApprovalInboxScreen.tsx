@@ -10,7 +10,7 @@ export default function ApprovalInboxScreen({ onReview }: { onReview: (id: numbe
   const { data, loading, error, refresh } = useRemote(api.pendingApprovals);
   return <ScrollView contentContainerStyle={styles.content}>
     <PageTitle title="Approval inbox" subtitle="Review release candidates after staging verification." />
-    {data?.mode === "demo" ? <Panel style={styles.demoNotice}><Text style={styles.authTitle}>Local demo mode</Text><Text style={styles.body}>Actions are saved for demonstration, use a fixed unverified identity and never start a production deployment.</Text></Panel> : null}
+    {data?.mode === "demo" ? <Panel style={styles.demoNotice}><Text style={styles.authTitle}>DEMO MODE</Text><Text style={styles.body}>Actions are saved for demonstration, use a fixed unverified identity and never start a production deployment.</Text></Panel> : null}
     {data?.mode === "token" ? <Panel style={styles.authNotice}><Text style={styles.authTitle}>Service authentication</Text><Text style={styles.body}>This server is using its configured approval credential. Manager identity verification depends on the connected authentication provider.</Text></Panel> : null}
     {loading ? <LoadingState label="Loading pending release requests…" /> : error ? <MessageState title="Approval requests could not be loaded" detail={error} action={<Text onPress={refresh} style={styles.link}>Try again</Text>} /> : null}
     {!loading && !error && data?.items.length === 0 ? <MessageState title="Inbox is clear" detail="There are no releases awaiting approval." /> : null}

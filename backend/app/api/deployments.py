@@ -441,8 +441,6 @@ def cancel_staging(project_id: int, db: Session = Depends(get_db)):
 
 @router.post("/{project_id}/deploy/production", status_code=202)
 def deploy_production(project_id: int, requester_identity: str | None = Header(default=None, alias="X-Requester-Identity"), db: Session = Depends(get_db)):
-    if settings.deployment_target == "remote":
-        raise HTTPException(status_code=501, detail="Production blue-green operations have not been migrated to the remote worker")
     project = _get_project(project_id, db)
     if not db.query(Analysis).filter(Analysis.project_id == project_id).first():
         return _fail("production", "Run analysis before deploying")
@@ -464,7 +462,7 @@ def deploy_production(project_id: int, requester_identity: str | None = Header(d
         raise HTTPException(status_code=409, detail=str(exc)) from exc
     db.refresh(approval)
     return {"status": approval.status, "approval_id": approval.id, "created": created,
-            "message": "Production deployment is gated pending an approval decision"}
+            "message": "Release approval request submitted; no production deployment was started"}
 
 
 

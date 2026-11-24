@@ -350,6 +350,10 @@ def get_release_workflow(project_id: int, db: Session = Depends(get_db)):
         production_status = "Completed"
         production_output = "Approved release is healthy in production."
         prod_time = latest_approval.updated_at
+    elif latest_approval and latest_approval.status == "Approved":
+        production_status = "Skipped"
+        production_output = "Demo approval was recorded; production promotion was not started."
+        prod_time = None
     elif latest_approval and latest_approval.status == "Production Deploying":
         production_status = "Running"
         production_output = "Production deployment started after approval."

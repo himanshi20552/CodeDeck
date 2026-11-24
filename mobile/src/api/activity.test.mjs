@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
 import test from "node:test";
 import { normalizeActivity } from "./activity.mjs";
 import { activityViewState } from "./activityState.mjs";
@@ -48,4 +49,11 @@ test("approval notifications identify new pending requests and ignore initial hi
   assert.deepEqual(findNewApprovalRequests(null, previous), []);
   assert.deepEqual(findNewApprovalRequests([2], [{ id: 2 }, { id: 3 }]), [{ id: 3 }]);
   assert.deepEqual(findNewApprovalRequests([2, 3], [{ id: 2 }, { id: 3 }]), []);
+});
+
+test("mobile approval client contains no server-side approval credential", () => {
+  const client = readFileSync(new URL("./client.ts", import.meta.url), "utf8");
+  const authAdapter = readFileSync(new URL("./auth.ts", import.meta.url), "utf8");
+  assert.equal(client.includes("RELEASE_APPROVAL_TOKEN"), false);
+  assert.equal(authAdapter.includes("RELEASE_APPROVAL_TOKEN"), false);
 });

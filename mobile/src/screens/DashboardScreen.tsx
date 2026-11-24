@@ -33,7 +33,7 @@ export default function DashboardScreen({ onProject, onApproval, onApprovals, pe
 
   return <ScrollView contentContainerStyle={styles.content}>
     <PageTitle title="Manager overview" subtitle="Release progress and delivery health from your CodeDeck workspace." />
-    <Panel style={styles.overviewLine}><Text style={styles.overviewText}>{rows.length} projects · {activeCount} in progress · {pending.length} awaiting approval</Text>{approvalError ? <Text style={styles.body}>Approval inbox unavailable: {approvalError}</Text> : approvalMode === "demo" ? <Text style={styles.demoText}>Local demo mode · decisions are unverified and do not deploy.</Text> : null}<Pressable onPress={onApprovals}><Text style={styles.link}>Open approval inbox  ›</Text></Pressable></Panel>
+    <Panel style={styles.overviewLine}><Text style={styles.overviewText}>{rows.length} projects · {activeCount} in progress · {pending.length} awaiting approval</Text>{approvalError ? <Text style={styles.body}>Approval inbox unavailable: {approvalError}</Text> : approvalMode === "demo" ? <Text style={styles.demoText}>Demo mode · decisions are unverified and do not deploy.</Text> : null}<Pressable onPress={onApprovals}><Text style={styles.link}>Open approval inbox  ›</Text></Pressable></Panel>
     <View style={styles.sectionHeader}><Text style={styles.sectionTitle}>Delivery portfolio</Text><Text style={styles.sectionMeta}>{flowsLoading ? "Refreshing" : `${workflowsDone.length} workflows`}</Text></View>
     {flowError ? <MessageState title="Some workflow data could not be loaded" detail={flowError} /> : null}
     {rows.length === 0 ? <MessageState title="No projects yet" detail="Projects will appear here after they are connected in CodeDeck." /> : rows.map((project) => {

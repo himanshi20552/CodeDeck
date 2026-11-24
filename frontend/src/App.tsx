@@ -1,18 +1,18 @@
 import { useEffect, useRef, useState, type FormEvent } from 'react'
 import {
-  approveProduction, askRepositoryQuestion, cancelStaging, cleanupDeployment, createProject,
+  approveProduction, askRepositoryQuestion, cancelStaging, cleanupDeployment, configureAutoscaling, disableAutoscaling, getAutoscaling, clearProjectWorkspace, deleteProject, createProject,
   deployProduction, deployStaging, getAnalysis, getEvaluation,
-  getFiles, getHealth, getPipeline, getProject, getSystemStatus,
+  getFiles, getHealth, getMonitoringDashboard, getPipeline, getProject, getReleaseWorkflow, getSystemStatus,
   listDeployments, listProjects, rollbackProduction, runAiTests,
   startAnalysis,
   type Analysis, type Deployment, type Evaluation, type GeneratedFile,
   type GeneratedTestRun, type PipelineStep, type Project,
-  type RepositoryAnswer, type SystemStatus,
+  type RepositoryAnswer, type ReleaseWorkflow, type MonitoringDashboard, type SystemStatus, type AutoscalingConfiguration, type AutoscalingStatus,
 } from './api'
 
 // ─── helpers ───────────────────────────────────────────────────────────────
 
-type Page = 'overview' | 'repository' | 'assistant' | 'intelligence' | 'testing' | 'docker' | 'kubernetes' | 'logs' | 'settings'
+type Page = 'overview' | 'release' | 'monitoring' | 'repository' | 'assistant' | 'intelligence' | 'testing' | 'docker' | 'kubernetes' | 'logs' | 'settings'
 
 const PIPELINE_STEPS = [
   'Repository Analysis', 'Repository Intelligence', 'Tests',
@@ -39,6 +39,40 @@ function stepIcon(s: string) {
   if (s === 'running') return '●'
   if (s === 'warning') return '⚠'
   return '○'
+}
+
+function formatDuration(seconds: number | null | undefined) {
+  if (seconds == null || !Number.isFinite(seconds)) return 'Not recorded'
+  if (seconds < 60) return `${seconds}s`
+  const minutes = Math.floor(seconds / 60)
+  const remainder = seconds % 60
+  return minutes < 60 ? `${minutes}m ${remainder}s` : `${Math.floor(minutes / 60)}h ${minutes % 60}m`
+}
+
+function formatWorkflowTime(value: string | null | undefined) {
+  return value ? new Date(value).toLocaleString() : 'Not recorded'
+}
+
+function formatBytes(value: number | null | undefined) {
+  if (value == null || !Number.isFinite(value)) return 'Not available'
+  if (value < 1024) return `${Math.round(value)} B`
+  const units = ['KiB', 'MiB', 'GiB', 'TiB']
+  let amount = value / 1024
+  let index = 0
+  while (amount >= 1024 && index < units.length - 1) { amount /= 1024; index++ }
+  return `${amount.toFixed(1)} ${units[index]}`
+}
+
+function workflowStatusClass(status: string) {
+  switch (status) {
+    case 'Completed': return 'border-emerald-700/50 bg-emerald-950/20 text-emerald-300'
+    case 'Running': return 'border-sky-700/50 bg-sky-950/20 text-sky-300'
+    case 'Queued': return 'border-amber-700/50 bg-amber-950/20 text-amber-300'
+    case 'Failed': return 'border-red-700/50 bg-red-950/20 text-red-300'
+    case 'Blocked': return 'border-orange-800/50 bg-orange-950/20 text-orange-300'
+    case 'Skipped': return 'border-zinc-700 bg-zinc-900 text-zinc-400'
+    default: return 'border-zinc-800 bg-zinc-900/50 text-zinc-500'
+  }
 }
 
 function friendlyError(message: string) {
@@ -171,9 +205,20 @@ export default function App() {
   const [selected, setSelected] = useState<Project | null>(null)
   const [analysis, setAnalysis] = useState<Analysis | null>(null)
   const [pipeline, setPipeline] = useState<PipelineStep[]>([])
+  const [releaseWorkflow, setReleaseWorkflow] = useState<ReleaseWorkflow | null>(null)
+  const [monitoringData, setMonitoringData] = useState<MonitoringDashboard | null>(null)
+  const [monitoringProjectFilter, setMonitoringProjectFilter] = useState('all')
+  const [monitoringDeploymentFilter, setMonitoringDeploymentFilter] = useState('all')
+  const [monitoringTimeFilter, setMonitoringTimeFilter] = useState('24h')
+  const [monitoringError, setMonitoringError] = useState<string | null>(null)
+  const [monitoringLoading, setMonitoringLoading] = useState(false)
   const [files, setFiles] = useState<GeneratedFile[]>([])
   const [selectedFile, setSelectedFile] = useState<string | null>(null)
   const [deployments, setDeployments] = useState<Deployment[]>([])
+  const [autoscalingStatus, setAutoscalingStatus] = useState<AutoscalingStatus | null>(null)
+  const [autoscalingConfig, setAutoscalingConfig] = useState<AutoscalingConfiguration>({ min_replicas: 1, max_replicas: 3, target_cpu_utilization: 70, target_memory_utilization: null, behavior: { scale_up_stabilization_seconds: 0, scale_down_stabilization_seconds: 300 } })
+  const [autoscalingBusy, setAutoscalingBusy] = useState(false)
+  const [autoscalingError, setAutoscalingError] = useState<string | null>(null)
   const [qaResult, setQaResult] = useState<RepositoryAnswer | null>(null)
   const [question, setQuestion] = useState('What framework does this project use?')
   const [evaluation, setEvaluation] = useState<Evaluation | null>(null)
@@ -194,6 +239,26 @@ export default function App() {
   const [logs, setLogs] = useState<Array<{ tag: string; text: string; ts: string }>>([])
   const selectedProjectId = useRef<number | null>(null)
   const pollStartedAt = useRef<Record<number, number>>({})
+  const autoscalingFormInitialized = useRef<Record<number, boolean>>({})
+  const autoscalingDeploymentId = deployments.find(d => ['remote_staging', 'staging', 'production_green'].includes(d.deployment_type) && ['SUCCEEDED', 'healthy', 'staging_healthy', 'production_healthy', 'awaiting_approval'].includes(d.status))?.id ?? null
+
+  useEffect(() => {
+    if (!selected || autoscalingDeploymentId == null) { setAutoscalingStatus(null); return }
+    let stopped = false
+    const load = () => getAutoscaling(selected.id, autoscalingDeploymentId).then(data => {
+      if (stopped) return
+      setAutoscalingStatus(data)
+      setAutoscalingError(null)
+      const config = data.configuration?.config
+      if (config && !autoscalingFormInitialized.current[autoscalingDeploymentId]) {
+        setAutoscalingConfig(config)
+        autoscalingFormInitialized.current[autoscalingDeploymentId] = true
+      }
+    }).catch(err => { if (!stopped) setAutoscalingError(err instanceof Error ? err.message : 'Autoscaling status unavailable') })
+    void load()
+    const timer = window.setInterval(() => void load(), 10000)
+    return () => { stopped = true; window.clearInterval(timer) }
+  }, [selected?.id, autoscalingDeploymentId])
 
   const log = (tag: string, text: string) =>
     setLogs(p => [...p.slice(-500), { tag, text, ts: new Date().toLocaleTimeString() }])
@@ -256,12 +321,13 @@ export default function App() {
     if (isManual) setError(null)
     selectedProjectId.current = project.id
     setSelected(project)
-    const [a, steps, fresh, generated, deps] = await Promise.all([
+    const [a, steps, fresh, generated, deps, workflow] = await Promise.all([
       getAnalysis(project.id),
       getPipeline(project.id),
       getProject(project.id),
       getFiles(project.id),
       listDeployments(project.id),
+      getReleaseWorkflow(project.id),
     ])
     if (selectedProjectId.current !== project.id) return
     setAnalysis(a)
@@ -273,7 +339,62 @@ export default function App() {
       return generated.some(f => f.filename === prev) ? prev : generated[0]?.filename ?? null
     })
     setDeployments(deps)
+    setReleaseWorkflow(workflow)
     setProjects(prev => prev.map(p => p.id === fresh.id ? fresh : p))
+  }
+
+  function monitoringSince() {
+    if (monitoringTimeFilter === 'all') return null
+    const hours = monitoringTimeFilter === '1h' ? 1 : monitoringTimeFilter === '24h' ? 24 : 24 * 7
+    return new Date(Date.now() - hours * 60 * 60 * 1000).toISOString()
+  }
+
+  async function loadMonitoring() {
+    setMonitoringLoading(true)
+    try {
+      const result = await getMonitoringDashboard({
+        project_id: monitoringProjectFilter === 'all' ? null : Number(monitoringProjectFilter),
+        deployment_id: monitoringDeploymentFilter === 'all' ? null : Number(monitoringDeploymentFilter),
+        since: monitoringSince(), limit: 200,
+      })
+      setMonitoringData(result)
+      setMonitoringError(null)
+    } catch (err) {
+      setMonitoringError(err instanceof Error ? err.message : 'Monitoring data is unavailable')
+    } finally {
+      setMonitoringLoading(false)
+    }
+  }
+
+  useEffect(() => {
+    if (page !== 'monitoring') return
+    let closed = false
+    let timer: ReturnType<typeof setInterval>
+    const refresh = async () => {
+      if (closed) return
+      await loadMonitoring()
+    }
+    void refresh()
+    timer = setInterval(refresh, 15000)
+    return () => { closed = true; clearInterval(timer) }
+  }, [page, monitoringProjectFilter, monitoringDeploymentFilter, monitoringTimeFilter])
+
+  async function onManualReanalysis() {
+    const target = monitoringProjectFilter !== 'all'
+      ? projects.find(project => project.id === Number(monitoringProjectFilter))
+      : selected
+    if (!target) { setMonitoringError('Choose a project before starting analysis.'); return }
+    setBusy(true)
+    setMonitoringError(null)
+    try {
+      await startAnalysis(target.id)
+      await loadProject(target)
+      await loadMonitoring()
+    } catch (err) {
+      setMonitoringError(err instanceof Error ? err.message : 'Analysis could not be started')
+    } finally {
+      setBusy(false)
+    }
   }
 
   async function onAnalyze(e: FormEvent) {
@@ -289,15 +410,16 @@ export default function App() {
       log('Analysis', 'Repository cloned — running pipeline…')
       const result = await startAnalysis(project.id)
       setAnalysis(result)
-      const [steps, fresh, generated, deps] = await Promise.all([
+      const [steps, fresh, generated, deps, workflow] = await Promise.all([
         getPipeline(project.id), getProject(project.id),
-        getFiles(project.id), listDeployments(project.id),
+        getFiles(project.id), listDeployments(project.id), getReleaseWorkflow(project.id),
       ])
       setPipeline(steps)
       setSelected(fresh)
       setFiles(generated)
       setSelectedFile(generated[0]?.filename ?? null)
       setDeployments(deps)
+      setReleaseWorkflow(workflow)
       setProjects(prev => prev.map(p => p.id === fresh.id ? fresh : p))
       log('Analysis', `Done — ${result.language} / ${result.framework}`)
     } catch (err) {
@@ -357,12 +479,13 @@ export default function App() {
     log('Docker/K8s', 'Starting staging deployment…')
     try {
       await deployStaging(selected.id, deploymentTarget)
-      const [steps, fresh, deps] = await Promise.all([
-        getPipeline(selected.id), getProject(selected.id), listDeployments(selected.id),
+      const [steps, fresh, deps, workflow] = await Promise.all([
+        getPipeline(selected.id), getProject(selected.id), listDeployments(selected.id), getReleaseWorkflow(selected.id),
       ])
       setPipeline(steps)
       setSelected(fresh)
       setDeployments(deps)
+      setReleaseWorkflow(workflow)
       setProjects(prev => prev.map(p => p.id === fresh.id ? fresh : p))
       log('Docker/K8s', 'Staging deployment initiated (running in background)')
     } catch (err) {
@@ -382,9 +505,10 @@ export default function App() {
     try {
       const result = await cancelStaging(selected.id)
       log('Docker/K8s', result.message)
-      const [steps, fresh] = await Promise.all([getPipeline(selected.id), getProject(selected.id)])
+      const [steps, fresh, workflow] = await Promise.all([getPipeline(selected.id), getProject(selected.id), getReleaseWorkflow(selected.id)])
       setPipeline(steps)
       setSelected(fresh)
+      setReleaseWorkflow(workflow)
       setProjects(prev => prev.map(p => p.id === fresh.id ? fresh : p))
     } catch (err) {
       const msg = err instanceof Error ? err.message : 'Unable to cancel staging'
@@ -416,10 +540,10 @@ export default function App() {
     setApprovingProd(true)
     try {
       await approveProduction(selected.id)
-      const [steps, fresh, deps] = await Promise.all([
-        getPipeline(selected.id), getProject(selected.id), listDeployments(selected.id),
+      const [steps, fresh, deps, workflow] = await Promise.all([
+        getPipeline(selected.id), getProject(selected.id), listDeployments(selected.id), getReleaseWorkflow(selected.id),
       ])
-      setPipeline(steps); setSelected(fresh); setDeployments(deps)
+      setPipeline(steps); setSelected(fresh); setDeployments(deps); setReleaseWorkflow(workflow)
       log('Kubernetes', 'Traffic switched to GREEN')
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Approval failed')
@@ -433,10 +557,10 @@ export default function App() {
     setRollingBack(true)
     try {
       await rollbackProduction(selected.id)
-      const [steps, fresh, deps] = await Promise.all([
-        getPipeline(selected.id), getProject(selected.id), listDeployments(selected.id),
+      const [steps, fresh, deps, workflow] = await Promise.all([
+        getPipeline(selected.id), getProject(selected.id), listDeployments(selected.id), getReleaseWorkflow(selected.id),
       ])
-      setPipeline(steps); setSelected(fresh); setDeployments(deps)
+      setPipeline(steps); setSelected(fresh); setDeployments(deps); setReleaseWorkflow(workflow)
       log('Kubernetes', 'Rolled back to BLUE')
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Rollback failed')
@@ -471,6 +595,8 @@ export default function App() {
   // ── sidebar ─────────────────────────────────────────────────────────────
   const NAV: { id: Page; label: string; icon: string }[] = [
     { id: 'overview', label: 'Overview', icon: '⬡' },
+    { id: 'release', label: 'Release Workflow', icon: '⇢' },
+    { id: 'monitoring', label: 'Monitoring', icon: '◉' },
     { id: 'repository', label: 'Repository', icon: '⎇' },
     { id: 'assistant', label: 'AI Assistant', icon: '◈' },
     { id: 'intelligence', label: 'Intelligence', icon: '◉' },
@@ -550,6 +676,45 @@ export default function App() {
               <span className="rounded border border-zinc-700 bg-zinc-800 px-3 py-1 text-xs text-zinc-300">
                 {selected.repository_name}
               </span>
+            )}
+            {selected && (
+              <div className="flex gap-2">
+                <button className="rounded border border-zinc-700 px-2 py-1 text-[11px] text-zinc-300 hover:bg-zinc-800" onClick={async () => {
+                  if (!window.confirm('Clear the cloned repository and temporary deployment copies? Analysis results, generated files, deployment history, and Kubernetes resources will remain.')) return
+                  setError(null)
+                  try { const result = await clearProjectWorkspace(selected.id); window.alert(result.message); }
+                  catch (err) { setError(err instanceof Error ? err.message : 'Workspace cleanup failed') }
+                }}>Clear Repository Files</button>
+                <button className="rounded border border-amber-800 px-2 py-1 text-[11px] text-amber-300 hover:bg-amber-950/30" onClick={async () => {
+                  const owned = deployments.filter(d => ['remote_staging', 'staging'].includes(d.deployment_type) && ['SUCCEEDED', 'healthy', 'staging_healthy', 'FAILED', 'failed'].includes(d.status))
+                  if (!owned.length) { setError('No safely identifiable completed staging deployment is available to undeploy.'); return }
+                  const inventory = owned.map(d => {
+                    const details = (d.details ?? {}) as { namespace?: string }
+                    return `#${d.id} · namespace ${details.namespace ?? 'unknown'}`
+                  }).join('\n')
+                  if (!window.confirm(`Remove these application resources?\n${inventory}\n\nDeployments, services, ingress, configuration, and access bindings will be removed. Persistent volume claims and their data will be preserved. Remote cleanup may remain queued until the worker reports completion.`)) return
+                  setError(null)
+                  try {
+                    const results = []
+                    for (const deployment of owned) results.push(await cleanupDeployment(selected.id, deployment.id))
+                    window.alert(results.map(r => r.message).join('\n'))
+                    await loadProject(selected)
+                  } catch (err) { setError(err instanceof Error ? err.message : 'Undeploy did not complete') }
+                }}>Undeploy Application</button>
+                <button className="rounded border border-red-900 px-2 py-1 text-[11px] text-red-300 hover:bg-red-950/30" onClick={async () => {
+                  const name = window.prompt(`Permanently delete ${selected.repository_name}? This removes all associated analysis, generated files, pipeline steps, and deployment history. Type the project name to continue.`)
+                  if (name === null) return
+                  setError(null)
+                  try {
+                    const result = await deleteProject(selected.id, name)
+                    window.alert(result.message)
+                    setSelected(null)
+                    setAnalysis(null); setFiles([]); setDeployments([])
+                    setReleaseWorkflow(null)
+                    setProjects(await listProjects())
+                  } catch (err) { setError(err instanceof Error ? err.message : 'Project deletion failed') }
+                }}>Delete Project</button>
+              </div>
             )}
             {selected && files.length > 0 && (
               <>
@@ -650,6 +815,255 @@ export default function App() {
                         </div>
                       )
                     })}
+                  </div>
+                </>
+              )}
+            </div>
+          )}
+
+          {page === 'monitoring' && (
+            <div className="space-y-6 max-w-[90rem]">
+              <div className="flex flex-wrap items-end justify-between gap-4">
+                <div>
+                  <SectionTitle>CodeDeck Monitoring</SectionTitle>
+                  <p className="text-[11px] text-zinc-500">Repository activity uses Watchdog. Kubernetes health and metrics use Kubernetes APIs and Metrics Server when available.</p>
+                </div>
+                <div className="flex flex-wrap gap-2">
+                  <label className="text-[10px] text-zinc-500">Project
+                    <select value={monitoringProjectFilter} onChange={e => { setMonitoringProjectFilter(e.target.value); setMonitoringDeploymentFilter('all') }} className="ml-2 rounded border border-zinc-700 bg-zinc-900 px-2 py-1.5 text-xs text-zinc-200">
+                      <option value="all">All projects</option>
+                      {projects.map(project => <option key={project.id} value={project.id}>{project.repository_name}</option>)}
+                    </select>
+                  </label>
+                  <label className="text-[10px] text-zinc-500">Deployment
+                    <select value={monitoringDeploymentFilter} onChange={e => setMonitoringDeploymentFilter(e.target.value)} className="ml-2 max-w-48 rounded border border-zinc-700 bg-zinc-900 px-2 py-1.5 text-xs text-zinc-200">
+                      <option value="all">All deployments</option>
+                      {(monitoringData?.deployment_events ?? []).map(deployment => <option key={deployment.id} value={deployment.id}>#{deployment.id} · {deployment.environment} · {deployment.status}</option>)}
+                    </select>
+                  </label>
+                  <label className="text-[10px] text-zinc-500">Time
+                    <select value={monitoringTimeFilter} onChange={e => setMonitoringTimeFilter(e.target.value)} className="ml-2 rounded border border-zinc-700 bg-zinc-900 px-2 py-1.5 text-xs text-zinc-200">
+                      <option value="1h">Last hour</option><option value="24h">Last 24 hours</option><option value="7d">Last 7 days</option><option value="all">All time</option>
+                    </select>
+                  </label>
+                  <button onClick={() => void loadMonitoring()} className="rounded border border-zinc-700 px-3 py-1.5 text-xs text-zinc-300 hover:bg-zinc-800">{monitoringLoading ? 'Refreshing…' : 'Refresh'}</button>
+                </div>
+              </div>
+
+              {monitoringError && <div className="rounded border border-red-800/60 bg-red-950/30 px-4 py-3 text-xs text-red-300">{monitoringError}</div>}
+              {monitoringData && (
+                <>
+                  <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-5">
+                    {Object.entries(monitoringData.system_health).map(([name, health]) => (
+                      <div key={name} className="rounded border border-zinc-800 bg-zinc-900/60 p-3">
+                        <div className="flex items-center justify-between gap-2">
+                          <span className="text-[10px] uppercase tracking-widest text-zinc-500">{name.replace('_', ' ')}</span>
+                          <span className={`rounded border px-1.5 py-0.5 text-[9px] uppercase ${health.status === 'available' ? 'border-emerald-800 text-emerald-300' : health.status === 'not_required' ? 'border-zinc-700 text-zinc-400' : 'border-amber-800 text-amber-300'}`}>{health.status}</span>
+                        </div>
+                        <div className="mt-2 text-[10px] text-zinc-400">{health.message}</div>
+                        {health.sampled_at && <div className="mt-1 text-[9px] text-zinc-600">Sample: {formatWorkflowTime(health.sampled_at)}</div>}
+                      </div>
+                    ))}
+                    <div className="rounded border border-zinc-800 bg-zinc-900/60 p-3">
+                      <div className="flex items-center justify-between gap-2"><span className="text-[10px] uppercase tracking-widest text-zinc-500">Monitoring service</span><span className={`rounded border px-1.5 py-0.5 text-[9px] uppercase ${monitoringData.monitoring_service.status === 'available' ? 'border-emerald-800 text-emerald-300' : 'border-amber-800 text-amber-300'}`}>{monitoringData.monitoring_service.status}</span></div>
+                      <div className="mt-2 text-[10px] text-zinc-400">Watchdog {monitoringData.monitoring_service.observer_running ? 'running' : 'stopped'} · {monitoringData.monitoring_service.monitored_project_count} registered project(s)</div>
+                      <div className="mt-1 text-[9px] text-zinc-600">Kubernetes mode: {monitoringData.monitoring_service.kubernetes_mode} · Last file event: {formatWorkflowTime(monitoringData.monitoring_service.last_event_at)}</div>
+                      {monitoringData.monitoring_service.last_error && <div className="mt-2 text-[10px] text-amber-300">{monitoringData.monitoring_service.last_error}</div>}
+                    </div>
+                  </div>
+
+                  <div className="grid gap-5 xl:grid-cols-2">
+                    <section className="rounded border border-zinc-800 bg-zinc-900/40 p-4">
+                      <div className="mb-3 flex flex-wrap items-center justify-between gap-3"><SectionTitle>Repository File Activity</SectionTitle>
+                        {(monitoringProjectFilter !== 'all' || selected) && <button disabled={busy} onClick={() => void onManualReanalysis()} className="rounded border border-sky-800 px-3 py-1.5 text-[10px] text-sky-300 hover:bg-sky-950/40 disabled:opacity-50">{busy ? 'Analysis running…' : 'Run fresh analysis'}</button>}
+                      </div>
+                      <p className="mb-3 text-[10px] text-zinc-600">File contents are never stored. Changes are recorded with their CodeDeck workflow context; they do not trigger a deployment automatically.</p>
+                      {monitoringData.file_activity.length ? <div className="max-h-[28rem] overflow-auto rounded border border-zinc-800">
+                        {monitoringData.file_activity.map(event => <div key={event.id} className="grid gap-1 border-b border-zinc-900 px-3 py-2 sm:grid-cols-[7rem_1fr_auto] sm:items-center">
+                          <span className="text-[9px] text-zinc-600">{formatWorkflowTime(event.occurred_at)}</span>
+                          <div className="min-w-0"><div className="break-all font-mono text-[10px] text-zinc-300">{event.path}</div><div className="mt-0.5 text-[9px] text-zinc-600">{event.summary ?? event.event_type} · {event.workflow_context} · {event.processing_status}</div></div>
+                          <span className={`w-fit rounded border px-1.5 py-0.5 text-[9px] uppercase ${event.event_type === 'deleted' ? 'border-red-900 text-red-300' : 'border-zinc-700 text-zinc-400'}`}>{event.event_type}</span>
+                        </div>)}
+                      </div> : <p className="py-6 text-center text-xs text-zinc-600">No repository events in this time range.</p>}
+                    </section>
+
+                    <section className="rounded border border-zinc-800 bg-zinc-900/40 p-4">
+                      <SectionTitle>Deployment Rollout Health</SectionTitle>
+                      {monitoringData.kubernetes.status !== 'available' && <p className="mb-3 rounded border border-amber-900/50 bg-amber-950/20 p-3 text-xs text-amber-300">{monitoringData.kubernetes.message ?? 'Kubernetes monitoring is unavailable.'}</p>}
+                      {!!monitoringData.kubernetes.nodes?.length && <div className="mb-3 flex flex-wrap gap-2">{monitoringData.kubernetes.nodes.map(node => <span key={node.name} className={`rounded border px-2 py-1 text-[9px] ${node.ready ? 'border-emerald-900 text-emerald-300' : 'border-red-900 text-red-300'}`}>Node {node.name}: {node.ready ? 'Ready' : node.reason ?? 'NotReady'}</span>)}</div>}
+                      <div className="space-y-2">
+                        {monitoringData.kubernetes.deployments.map(deployment => <div key={`${deployment.namespace}/${deployment.name}`} className="rounded border border-zinc-800 p-3">
+                          <div className="flex flex-wrap items-center justify-between gap-2 text-xs"><span className="font-mono text-zinc-200">{deployment.namespace}/{deployment.name}</span><span className={`rounded border px-1.5 py-0.5 text-[9px] uppercase ${deployment.status === 'healthy' ? 'border-emerald-800 text-emerald-300' : deployment.status === 'unhealthy' ? 'border-red-800 text-red-300' : 'border-amber-800 text-amber-300'}`}>{deployment.status}</span></div>
+                          <div className="mt-2 text-[10px] text-zinc-500">Ready {deployment.ready_replicas}/{deployment.desired_replicas} · Available {deployment.available_replicas} · Updated {deployment.updated_replicas}{deployment.reason ? ` · ${deployment.reason}` : ''}</div>
+                        </div>)}
+                        {monitoringData.kubernetes.deployments.length === 0 && monitoringData.kubernetes.status === 'available' && <p className="py-3 text-xs text-zinc-600">No monitored Kubernetes deployments in the selected scope.</p>}
+                      </div>
+                      <SectionTitle>Pods and Autoscaling</SectionTitle>
+                      <div className="max-h-72 space-y-2 overflow-auto">
+                        {monitoringData.kubernetes.pods.map(pod => <div key={`${pod.namespace}/${pod.name}`} className="flex flex-wrap items-center justify-between gap-2 rounded border border-zinc-800 px-3 py-2 text-[10px]">
+                          <span className="min-w-0 break-all font-mono text-zinc-300">{pod.namespace}/{pod.name}</span><span className={pod.ready && !pod.reason ? 'text-emerald-300' : 'text-amber-300'}>{pod.ready ? 'Ready' : pod.reason ?? pod.phase}</span><span className={pod.restart_count >= 3 ? 'text-red-300' : 'text-zinc-500'}>Restarts {pod.restart_count}</span>
+                        </div>)}
+                        {monitoringData.kubernetes.pods.length === 0 && monitoringData.kubernetes.status === 'available' && <p className="text-xs text-zinc-600">No pods in the selected scope.</p>}
+                        {monitoringData.kubernetes.hpas.map(hpa => <div key={`${hpa.namespace}/${hpa.name}`} className="rounded border border-zinc-800 px-3 py-2 text-[10px] text-zinc-400">HPA {hpa.namespace}/{hpa.name} · replicas {hpa.current_replicas}/{hpa.desired_replicas} · range {hpa.min_replicas}–{hpa.max_replicas ?? '—'}</div>)}
+                      </div>
+                    </section>
+                  </div>
+
+                  <div className="grid gap-5 xl:grid-cols-2">
+                    <section className="rounded border border-zinc-800 bg-zinc-900/40 p-4">
+                      <SectionTitle>Resource Usage</SectionTitle>
+                      {monitoringData.kubernetes.metrics.status === 'available' ? <>
+                        <div className="mb-3 text-[10px] text-zinc-500">Metrics Server sample: {formatWorkflowTime(monitoringData.kubernetes.metrics.sampled_at)}</div>
+                        {monitoringData.kubernetes.metrics.pods.map(metric => <div key={`${metric.namespace}/${metric.name}`} className="flex flex-wrap justify-between gap-2 border-b border-zinc-900 py-2 text-[10px]"><span className="font-mono text-zinc-300">{metric.namespace}/{metric.name}</span><span className="text-zinc-400">CPU {metric.cpu_millicores}m · Memory {formatBytes(metric.memory_bytes)}</span></div>)}
+                        {monitoringData.kubernetes.metrics.nodes.map(metric => <div key={metric.name} className="flex flex-wrap justify-between gap-2 border-b border-zinc-900 py-2 text-[10px]"><span className="font-mono text-zinc-300">Node {metric.name}</span><span className="text-zinc-400">CPU {metric.cpu_millicores == null ? 'Not available' : `${metric.cpu_millicores}m`} · Memory {formatBytes(metric.memory_bytes)}</span></div>)}
+                        {!monitoringData.kubernetes.metrics.pods.length && !monitoringData.kubernetes.metrics.nodes.length && <p className="text-xs text-zinc-600">Metrics Server returned no usage records for this scope.</p>}
+                      </> : <p className="rounded border border-amber-900/50 bg-amber-950/20 p-3 text-xs text-amber-300">{monitoringData.kubernetes.metrics.message || 'Metrics Server is unavailable; no CPU or memory values are reported.'}</p>}
+                    </section>
+
+                    <section className="rounded border border-zinc-800 bg-zinc-900/40 p-4">
+                      <SectionTitle>Recent Deployment Events</SectionTitle>
+                      {monitoringData.deployment_events.length ? <div className="space-y-2">
+                        {monitoringData.deployment_events.map(event => <details key={event.id} className="rounded border border-zinc-800 p-3">
+                          <summary className="flex cursor-pointer flex-wrap items-center justify-between gap-2 text-[10px]"><span className="text-zinc-300">#{event.id} · {event.environment} · {event.status}</span><span className="text-zinc-600">{formatWorkflowTime(event.created_at)}</span></summary>
+                          {event.logs.length > 0 && <TerminalBlock text={event.logs.map(line => `${line.time ?? ''} ${line.message}`.trim()).join('\n')} maxH="8rem" />}
+                          {!event.logs.length && <div className="mt-2 text-[10px] text-zinc-600">No persisted log lines for this deployment record.</div>}
+                        </details>)}
+                      </div> : <p className="text-xs text-zinc-600">No deployment events in the selected time range.</p>}
+                    </section>
+                  </div>
+
+                  <section className="rounded border border-zinc-800 bg-zinc-900/40 p-4">
+                    <SectionTitle>Alert History</SectionTitle>
+                    {monitoringData.alerts.length ? <div className="space-y-2">
+                      {monitoringData.alerts.map(alert => <div key={alert.id} className="grid gap-2 rounded border border-zinc-800 p-3 sm:grid-cols-[8rem_1fr_auto] sm:items-start">
+                        <div className="text-[9px] text-zinc-600">{formatWorkflowTime(alert.last_seen)}</div>
+                        <div><div className="text-xs font-semibold text-zinc-200">{alert.title}</div><div className="mt-1 text-[10px] text-zinc-400">{alert.message}</div><div className="mt-1 text-[9px] text-zinc-600">{alert.source} · {alert.occurrence_count} occurrence(s)</div></div>
+                        <span className={`w-fit rounded border px-1.5 py-0.5 text-[9px] uppercase ${alert.is_resolved ? 'border-zinc-700 text-zinc-500' : alert.severity === 'critical' ? 'border-red-800 text-red-300' : 'border-amber-800 text-amber-300'}`}>{alert.is_resolved ? 'Resolved' : alert.severity}</span>
+                      </div>)}
+                    </div> : <p className="text-xs text-zinc-600">No alerts in the selected time range.</p>}
+                  </section>
+                </>
+              )}
+            </div>
+          )}
+
+          {page === 'release' && (
+            <div className="space-y-6 max-w-[90rem]">
+              <SectionTitle>Release Overview</SectionTitle>
+              {!selected ? (
+                <p className="text-sm text-zinc-500">Choose a project to view its release workflow.</p>
+              ) : !releaseWorkflow ? (
+                <p className="text-sm text-zinc-500">Workflow history is unavailable. Refresh the project to load persisted pipeline and deployment records.</p>
+              ) : (
+                <>
+                  <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-4">
+                    {[
+                      ['Repository', releaseWorkflow.release.repository_name],
+                      ['Branch', releaseWorkflow.release.branch ?? 'Not recorded'],
+                      ['Commit', releaseWorkflow.release.commit_id ? releaseWorkflow.release.commit_id.slice(0, 12) : 'Not recorded'],
+                      ['Commit message', releaseWorkflow.release.commit_message ?? 'Not recorded'],
+                      ['Environment', releaseWorkflow.release.environment ?? 'Not deployed'],
+                      ['Version', releaseWorkflow.release.version ?? 'Not assigned'],
+                      ['Release status', releaseWorkflow.release.status],
+                      ['Approval', releaseWorkflow.release.approval_status],
+                      ['Workflow elapsed', formatDuration(releaseWorkflow.analytics.total_duration_seconds)],
+                    ].map(([label, value]) => (
+                      <div key={label} className="min-w-0 rounded border border-zinc-800 bg-zinc-900/60 p-3">
+                        <div className="text-[10px] uppercase tracking-widest text-zinc-600">{label}</div>
+                        <div className="mt-1 truncate text-xs text-zinc-200" title={value}>{value}</div>
+                      </div>
+                    ))}
+                  </div>
+
+                  <div className="rounded border border-zinc-800 bg-zinc-900/40 p-4">
+                    <div className="mb-1 text-[10px] uppercase tracking-widest text-zinc-500">Delivery workflow</div>
+                    <p className="mb-4 text-[11px] text-zinc-500">Development through production promotion. Pull request and external CI integrations are not connected; staging and production actions are manually triggered.</p>
+                    <div className="flex flex-col gap-3 overflow-x-auto pb-2 md:flex-row md:items-stretch">
+                      {releaseWorkflow.stages.map((stage, index) => (
+                        <div key={stage.id} className="flex min-w-0 items-stretch gap-3 md:w-auto md:flex-none">
+                          <article className={`w-full rounded border p-3 md:w-64 ${workflowStatusClass(stage.status)}`}>
+                            <div className="flex items-start justify-between gap-2">
+                              <h3 className="text-xs font-semibold leading-5">{index + 1}. {stage.name}</h3>
+                              <span className="shrink-0 rounded border border-current/30 px-1.5 py-0.5 text-[9px] uppercase">{stage.status}</span>
+                            </div>
+                            <div className="mt-2 text-[10px] text-zinc-400">Duration: {formatDuration(stage.duration_seconds)}</div>
+                            {stage.waiting_seconds != null && <div className="mt-1 text-[10px] text-zinc-400">Waiting: {formatDuration(stage.waiting_seconds)}</div>}
+                            {stage.execution_seconds != null && <div className="mt-1 text-[10px] text-zinc-400">Execution: {formatDuration(stage.execution_seconds)}</div>}
+                            <details className="mt-3 border-t border-current/20 pt-2">
+                              <summary className="cursor-pointer text-[10px] font-medium">Stage details</summary>
+                              <div className="mt-2 space-y-2 text-[10px] text-zinc-300">
+                                <div><span className="text-zinc-500">Responsible:</span> {stage.actor}</div>
+                                <div><span className="text-zinc-500">Depends on:</span> {stage.dependencies.length ? stage.dependencies.map(id => releaseWorkflow.stages.find(item => item.id === id)?.name ?? id).join(', ') : 'None'}</div>
+                                <div><span className="text-zinc-500">Started:</span> {formatWorkflowTime(stage.started_at)}</div>
+                                <div><span className="text-zinc-500">Completed:</span> {formatWorkflowTime(stage.completed_at)}</div>
+                                {stage.output && <p className="whitespace-pre-wrap break-words text-zinc-400">{stage.output}</p>}
+                                {stage.logs.length > 0 && <div className="max-h-36 space-y-1 overflow-auto rounded bg-zinc-950/70 p-2 font-mono text-[9px]">
+                                  {stage.logs.map((entry, logIndex) => <div key={logIndex} className="whitespace-pre-wrap break-words">{typeof entry === 'string' ? entry : `${entry.time ?? ''} ${entry.message ?? ''}`.trim()}</div>)}
+                                </div>}
+                              </div>
+                            </details>
+                          </article>
+                          {index < releaseWorkflow.stages.length - 1 && (
+                            <div className="flex w-full items-center justify-center text-zinc-600 md:w-7">
+                              <span className="md:hidden">↓</span><span className="hidden md:inline">→</span>
+                            </div>
+                          )}
+                        </div>
+                      ))}
+                    </div>
+                    <p className="mt-2 text-[10px] text-zinc-600">{releaseWorkflow.analytics.duration_basis} Missing timestamps are shown as not recorded.</p>
+                  </div>
+
+                  <div className="grid gap-5 xl:grid-cols-2">
+                    <section className="rounded border border-zinc-800 bg-zinc-900/40 p-4">
+                      <SectionTitle>Repository Snapshot and File Changes</SectionTitle>
+                      <p className="mb-3 text-xs text-zinc-400">{releaseWorkflow.repository_snapshot.change_summary}</p>
+                      {releaseWorkflow.repository_snapshot.snapshot_available ? (
+                        <>
+                          <div className="mb-3 flex flex-wrap gap-2 text-[10px] text-zinc-500">
+                            <span>{releaseWorkflow.repository_snapshot.file_count ?? releaseWorkflow.repository_snapshot.files.length} tracked files discovered</span>
+                            <span>·</span><span>Added: {releaseWorkflow.repository_snapshot.added.length}</span>
+                            <span>·</span><span>Modified: {releaseWorkflow.repository_snapshot.modified.length}</span>
+                            <span>·</span><span>Deleted: {releaseWorkflow.repository_snapshot.deleted.length}</span>
+                          </div>
+                          <div className="max-h-72 overflow-auto rounded border border-zinc-800 bg-zinc-950/70">
+                            {releaseWorkflow.repository_snapshot.files.map(path => <div key={path} className="border-b border-zinc-900 px-3 py-1.5 font-mono text-[10px] text-zinc-300">{path}</div>)}
+                            {releaseWorkflow.repository_snapshot.files.length === 0 && <div className="p-3 text-xs text-zinc-600">No tracked file inventory was captured.</div>}
+                          </div>
+                          <p className="mt-3 text-[10px] text-zinc-600">No stage-to-file impact mapping is persisted. Change comparisons are not inferred from file paths.</p>
+                        </>
+                      ) : <p className="text-xs text-zinc-600">No Git snapshot metadata is stored for this analysis.</p>}
+                    </section>
+
+                    <section className="rounded border border-zinc-800 bg-zinc-900/40 p-4">
+                      <SectionTitle>Deployment History</SectionTitle>
+                      {releaseWorkflow.deployment_history.length ? <div className="space-y-3">
+                        {releaseWorkflow.deployment_history.map(deployment => {
+                          const info = (deployment.details ?? {}) as {
+                            target?: string; namespace?: string; image?: string; app_name?: string; application_port?: number;
+                            ingress_hostname?: string; failure_reason?: string; started_at?: string; completed_at?: string;
+                            logs?: Array<{ time?: string; message?: string }>; smoke?: { status?: string; url?: string | null; message?: string };
+                            result?: { deployment_status?: { ready_replicas?: number; replicas?: number } };
+                          }
+                          return <article key={deployment.id} className="rounded border border-zinc-800 p-3">
+                            <div className="flex flex-wrap justify-between gap-2 text-xs">
+                              <span className="font-semibold text-zinc-200">#{deployment.id} · {deployment.environment} · {deployment.status}</span>
+                              <span className="text-zinc-500">{formatWorkflowTime(deployment.created_at)}</span>
+                            </div>
+                            <div className="mt-2 grid gap-1 text-[10px] text-zinc-400 sm:grid-cols-2">
+                              <span>Target: {info.target ?? deployment.deployment_type}</span><span>Namespace: {info.namespace ?? 'Not recorded'}</span>
+                              <span>Image: {info.image ?? 'Not recorded'}</span><span>Application: {info.app_name ?? 'Not recorded'}</span>
+                              <span>Port: {info.application_port ?? 'Not recorded'}</span>
+                              <span>Ready replicas: {info.result?.deployment_status?.ready_replicas ?? 'Not recorded'}/{info.result?.deployment_status?.replicas ?? 'Not recorded'}</span>
+                              <span>Smoke test: {info.smoke?.status ?? 'Not recorded'}</span><span>URL: {info.smoke?.url ?? 'Not recorded'}</span>
+                              <span>Started: {formatWorkflowTime(info.started_at)}</span><span>Completed: {formatWorkflowTime(info.completed_at)}</span>
+                            </div>
+                            {info.failure_reason && <p className="mt-2 text-[10px] text-red-400">{info.failure_reason}</p>}
+                            {info.logs?.length ? <details className="mt-2"><summary className="cursor-pointer text-[10px] text-zinc-500">Deployment logs ({info.logs.length})</summary><TerminalBlock text={info.logs.map(line => `${line.time ?? ''} ${line.message ?? ''}`.trim()).join('\n')} maxH="10rem" /></details> : null}
+                          </article>
+                        })}
+                      </div> : <p className="text-xs text-zinc-600">No deployment records are available.</p>}
+                    </section>
                   </div>
                 </>
               )}
@@ -1355,6 +1769,70 @@ export default function App() {
                         })}
                       </div>
                     </div>
+                  )}
+
+                  {autoscalingDeploymentId != null && autoscalingStatus && (
+                    <section className="rounded border border-zinc-800 bg-zinc-900/50 p-4">
+                      <div className="mb-3 flex flex-wrap items-center justify-between gap-2">
+                        <div><div className="text-[10px] uppercase tracking-widest text-zinc-500">Horizontal Pod Autoscaling</div><div className="mt-1 font-mono text-xs text-zinc-300">{autoscalingStatus.namespace}/{autoscalingStatus.deployment_name}</div></div>
+                        <span className={`rounded border px-2 py-1 text-[10px] uppercase ${autoscalingStatus.hpa ? 'border-emerald-900 text-emerald-300' : 'border-zinc-700 text-zinc-400'}`}>{autoscalingStatus.hpa ? 'Active' : 'Not configured'}</span>
+                      </div>
+                      <p className="mb-3 text-[10px] text-zinc-500">HPA adjusts replicas within the configured range and owns the workload replica count while enabled. Removing it restores the saved replica count. CPU and memory targets require Metrics Server and container resource requests.</p>
+                      {autoscalingError && <p className="mb-3 rounded border border-red-900/60 p-2 text-xs text-red-300">{autoscalingError}</p>}
+                      {autoscalingStatus.monitoring_status !== 'available' && <p className="mb-3 rounded border border-amber-900/60 p-2 text-xs text-amber-300">{autoscalingStatus.message ?? 'Kubernetes monitoring is unavailable; do not treat the last sample as current.'}</p>}
+                      {autoscalingStatus.operation && <p className={`mb-3 rounded border p-2 text-xs ${autoscalingStatus.operation.status === 'FAILED' ? 'border-red-900/60 text-red-300' : autoscalingStatus.operation.status === 'QUEUED' || ['RUNNING', 'BUILDING', 'DEPLOYING', 'VERIFYING'].includes(autoscalingStatus.operation.status) ? 'border-sky-900/60 text-sky-300' : 'border-zinc-800 text-zinc-400'}`}>Operation {autoscalingStatus.operation.status}: {autoscalingStatus.operation.message ?? 'No operation detail available.'}</p>}
+                      <div className="mb-4 grid gap-3 sm:grid-cols-2 lg:grid-cols-4">
+                        <label className="text-[10px] text-zinc-500">Minimum replicas<input type="number" min="1" max="8" value={autoscalingConfig.min_replicas} onChange={event => setAutoscalingConfig(config => ({ ...config, min_replicas: Number(event.target.value) }))} className="mt-1 w-full rounded border border-zinc-700 bg-zinc-950 px-2 py-1.5 text-xs text-zinc-200" /></label>
+                        <label className="text-[10px] text-zinc-500">Maximum replicas<input type="number" min="1" max="8" value={autoscalingConfig.max_replicas} onChange={event => setAutoscalingConfig(config => ({ ...config, max_replicas: Number(event.target.value) }))} className="mt-1 w-full rounded border border-zinc-700 bg-zinc-950 px-2 py-1.5 text-xs text-zinc-200" /></label>
+                        <label className="text-[10px] text-zinc-500">Target CPU utilization (%)<input type="number" min="10" max="95" value={autoscalingConfig.target_cpu_utilization} onChange={event => setAutoscalingConfig(config => ({ ...config, target_cpu_utilization: Number(event.target.value) }))} className="mt-1 w-full rounded border border-zinc-700 bg-zinc-950 px-2 py-1.5 text-xs text-zinc-200" /></label>
+                        <label className="text-[10px] text-zinc-500">Target memory utilization (%) · optional<input type="number" min="10" max="95" value={autoscalingConfig.target_memory_utilization ?? ''} onChange={event => setAutoscalingConfig(config => ({ ...config, target_memory_utilization: event.target.value === '' ? null : Number(event.target.value) }))} className="mt-1 w-full rounded border border-zinc-700 bg-zinc-950 px-2 py-1.5 text-xs text-zinc-200" /></label>
+                        <label className="text-[10px] text-zinc-500">Scale-up stabilization (seconds)<input type="number" min="0" max="3600" value={autoscalingConfig.behavior.scale_up_stabilization_seconds} onChange={event => setAutoscalingConfig(config => ({ ...config, behavior: { ...config.behavior, scale_up_stabilization_seconds: Number(event.target.value) } }))} className="mt-1 w-full rounded border border-zinc-700 bg-zinc-950 px-2 py-1.5 text-xs text-zinc-200" /></label>
+                        <label className="text-[10px] text-zinc-500">Scale-down stabilization (seconds)<input type="number" min="0" max="3600" value={autoscalingConfig.behavior.scale_down_stabilization_seconds} onChange={event => setAutoscalingConfig(config => ({ ...config, behavior: { ...config.behavior, scale_down_stabilization_seconds: Number(event.target.value) } }))} className="mt-1 w-full rounded border border-zinc-700 bg-zinc-950 px-2 py-1.5 text-xs text-zinc-200" /></label>
+                      </div>
+                      <div className="mb-4 flex flex-wrap gap-2">
+                        <button disabled={autoscalingBusy} onClick={async () => {
+                          if (!selected || autoscalingDeploymentId == null) return
+                          if (autoscalingConfig.min_replicas > autoscalingConfig.max_replicas) { setAutoscalingError('Minimum replicas cannot exceed maximum replicas.'); return }
+                          if (!window.confirm('Enable Kubernetes autoscaling for this deployment? Kubernetes will control replica count within your configured range. Metrics Server and CPU resource requests are required; memory scaling also requires memory requests.')) return
+                          setAutoscalingBusy(true); setAutoscalingError(null)
+                          try {
+                            const result = await configureAutoscaling(selected.id, autoscalingDeploymentId, autoscalingConfig)
+                            setAutoscalingStatus(await getAutoscaling(selected.id, autoscalingDeploymentId))
+                            if (result.status === 'QUEUED') setAutoscalingStatus(previous => previous ? { ...previous, operation: { job_id: result.job_id, status: result.status, message: result.message } } : previous)
+                          } catch (err) { setAutoscalingError(err instanceof Error ? err.message : 'Autoscaling configuration failed') }
+                          finally { setAutoscalingBusy(false) }
+                        }} className="rounded bg-sky-700 px-3 py-2 text-[11px] font-medium text-white hover:bg-sky-600 disabled:opacity-50">{autoscalingBusy ? 'Applying…' : autoscalingStatus.hpa ? 'Update autoscaling' : 'Enable autoscaling'}</button>
+                        {autoscalingStatus.hpa && <button disabled={autoscalingBusy} onClick={async () => {
+                          if (!selected || autoscalingDeploymentId == null || !window.confirm('Remove the CodeDeck-managed HPA? Kubernetes will stop adjusting replicas and CodeDeck will restore the replica count saved before autoscaling was enabled.')) return
+                          setAutoscalingBusy(true); setAutoscalingError(null)
+                          try {
+                            const result = await disableAutoscaling(selected.id, autoscalingDeploymentId)
+                            setAutoscalingStatus(await getAutoscaling(selected.id, autoscalingDeploymentId))
+                            if (result.status === 'QUEUED') setAutoscalingStatus(previous => previous ? { ...previous, operation: { job_id: result.job_id, status: result.status, message: result.message } } : previous)
+                          } catch (err) { setAutoscalingError(err instanceof Error ? err.message : 'Autoscaling cleanup failed') }
+                          finally { setAutoscalingBusy(false) }
+                        }} className="rounded border border-red-900 px-3 py-2 text-[11px] text-red-300 hover:bg-red-950/30 disabled:opacity-50">{autoscalingBusy ? 'Working…' : 'Disable autoscaling'}</button>}
+                        <span className="self-center text-[9px] text-zinc-600">Last Kubernetes sample: {formatWorkflowTime(autoscalingStatus.sampled_at)}</span>
+                      </div>
+                      {autoscalingStatus.hpa ? <>
+                        <div className="mb-3 grid gap-2 sm:grid-cols-4">
+                          <div className="rounded border border-zinc-800 p-2 text-[10px] text-zinc-400">Replicas <strong className="text-zinc-200">{autoscalingStatus.hpa.current_replicas ?? 'Unavailable'}</strong> current · <strong className="text-zinc-200">{autoscalingStatus.hpa.desired_replicas ?? 'Unavailable'}</strong> desired</div>
+                          <div className="rounded border border-zinc-800 p-2 text-[10px] text-zinc-400">Ready replicas <strong className="text-zinc-200">{autoscalingStatus.rollout ? `${autoscalingStatus.rollout.ready_replicas}/${autoscalingStatus.rollout.desired_replicas}` : 'Unavailable'}</strong></div>
+                          <div className="rounded border border-zinc-800 p-2 text-[10px] text-zinc-400">Range <strong className="text-zinc-200">{autoscalingStatus.hpa.min_replicas}–{autoscalingStatus.hpa.max_replicas}</strong></div>
+                          {(['cpu', 'memory'] as const).map(resource => {
+                            const current = autoscalingStatus.hpa?.current_metrics?.find(metric => metric.name === resource)?.average_utilization
+                            const target = autoscalingStatus.hpa?.targets?.find(metric => metric.name === resource)?.average_utilization
+                            return <div key={resource} className="rounded border border-zinc-800 p-2 text-[10px] text-zinc-400">{resource.toUpperCase()} utilization <strong className="text-zinc-200">{current == null ? 'Unavailable' : `${current}%`}</strong> / target {target == null ? '—' : `${target}%`}</div>
+                          })}
+                        </div>
+                        <div className="mb-4 text-[10px] text-zinc-500">Autoscaler state: {autoscalingStatus.hpa.conditions?.filter(condition => condition.status === 'False').map(condition => `${condition.type}: ${condition.message ?? condition.reason ?? 'not ready'}`).join(' · ') || 'Active; no unhealthy HPA conditions reported.'}</div>
+                      </> : <div className="mb-4 rounded border border-zinc-800 p-3 text-[10px] text-zinc-500">{autoscalingStatus.metrics.status === 'unavailable' ? autoscalingStatus.metrics.message : 'No CodeDeck autoscaler is attached to this deployment.'}</div>}
+                      {autoscalingStatus.hpa && autoscalingStatus.deployment_name.endsWith('-staging') && <details className="mb-4 rounded border border-zinc-800 px-3 py-2 text-[10px] text-zinc-400"><summary className="cursor-pointer text-zinc-300">Controlled staging demonstration</summary><ol className="mt-2 list-decimal space-y-1 pl-4"><li>Record the actual current and desired replica counts above.</li><li>Send a short, rate-limited load only to a test CPU-intensive route on this isolated staging deployment.</li><li>Watch actual CPU utilization against the configured target; HPA reconciliation is not immediate.</li><li>When sustained utilization crosses the target, observe Kubernetes increase desired replicas.</li><li>Watch current and ready replicas until the additional pods become ready.</li><li>Stop the load and observe the actual replica samples through the configured scale-down stabilization window.</li><li>Use a non-production endpoint only. CodeDeck does not generate traffic automatically.</li></ol><p className="mt-2 text-zinc-600">A bounded example and prerequisites are in docs/kubernetes-autoscaling.md.</p></details>}
+                      {autoscalingStatus.events.length > 0 && <div><div className="mb-2 text-[10px] uppercase tracking-widest text-zinc-500">Replica history · observed Kubernetes samples</div><div className="flex h-24 items-end gap-2 overflow-x-auto rounded border border-zinc-800 px-3 pt-2">{autoscalingStatus.events.map(event => {
+                        const max = Math.max(1, ...autoscalingStatus.events.map(sample => sample.current_replicas ?? 0), ...autoscalingStatus.events.map(sample => sample.desired_replicas ?? 0))
+                        return <div key={event.id} title={`${formatWorkflowTime(event.occurred_at)} · current ${event.current_replicas ?? 'unavailable'}, desired ${event.desired_replicas ?? 'unavailable'}`} className="flex h-full min-w-8 flex-col items-center justify-end gap-1"><div className="w-5 rounded-t bg-sky-500/70" style={{ height: event.desired_replicas == null && event.current_replicas == null ? '0%' : `${Math.max(8, ((event.desired_replicas ?? event.current_replicas ?? 0) / max) * 75)}%` }} /><span className="pb-1 text-[8px] text-zinc-600">{event.current_replicas ?? '—'}</span></div>
+                      })}</div><div className="mt-1 flex justify-between text-[9px] text-zinc-600"><span>{formatWorkflowTime(autoscalingStatus.events[0].occurred_at)}</span><span>{formatWorkflowTime(autoscalingStatus.events[autoscalingStatus.events.length - 1].occurred_at)}</span></div></div>}
+                    </section>
                   )}
 
                   {/* Approval banner */}

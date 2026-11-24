@@ -32,7 +32,7 @@ from app.core.config import settings
 from app.db.database import SessionLocal
 from app.db.models import Analysis, GeneratedFile, Project
 from app.graph.state import DeployMindState
-from app.services.github import cleanup_repository, clone_repository
+from app.services.github import cleanup_repository, clone_repository, repository_snapshot_metadata
 from app.services.deployment_contract import build_deployment_contract
 from app.services.pipeline import upsert_step
 from app.services.observability import measured
@@ -118,6 +118,7 @@ def clone_and_analyze(state: DeployMindState) -> DeployMindState:
         result = analyze_repository(dest)
         analysis = result.model_dump()
         analysis["repository_name"] = state.get("repository_name") or dest.name
+        analysis["repository_snapshot"] = repository_snapshot_metadata(dest)
 
         if not result.supported:
             _mark_step(project_id, "Repository Analysis", "failed", error=result.message)

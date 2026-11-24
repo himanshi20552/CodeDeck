@@ -57,6 +57,36 @@ def cleanup_repository(path: Path) -> None:
             shutil.rmtree(path, ignore_errors=True)
 
 
+def repository_snapshot_metadata(path: Path) -> dict:
+    """Read truthful Git identity and tracked-file inventory from a checked-out snapshot."""
+    path = Path(path)
+
+    def git(*args: str) -> str | None:
+        try:
+            proc = subprocess.run(["git", "-C", str(path), *args], capture_output=True, text=True, timeout=10)
+            return proc.stdout.strip() if proc.returncode == 0 else None
+        except (OSError, subprocess.TimeoutExpired):
+            return None
+
+    commit = git("rev-parse", "HEAD")
+    branch = git("branch", "--show-current")
+    message = git("log", "-1", "--format=%s")
+    tracked = git("ls-files")
+    files = tracked.splitlines() if tracked else []
+    return {
+        "branch": branch or None,
+        "commit_id": commit or None,
+        "commit_message": message or None,
+        "files": files,
+        "file_count": len(files),
+        "comparison_available": False,
+        "added": [],
+        "modified": [],
+        "deleted": [],
+        "change_summary": "Only the current shallow repository snapshot is retained; no historical revision comparison is available.",
+    }
+
+
 def clone_repository(url: str, dest: Path) -> Path:
     url = validate_github_url(url)
     dest = dest.resolve()

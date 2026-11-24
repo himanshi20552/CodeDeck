@@ -1,0 +1,13 @@
+{
+  "expo": {
+    "name": "CodeDeck Manager",
+    "slug": "codedeck-manager",
+    "version": "0.1.0",
+    "orientation": "portrait",
+    "userInterfaceStyle": "light",
+    "platforms": ["ios", "android"],
+    "newArchEnabled": true,
+    "ios": { "supportsTablet": true, "bundleIdentifier": "com.codedeck.manager" },
+    "android": { "package": "com.codedeck.manager" }
+  }
+}

@@ -30,6 +30,8 @@ class WorkerClient:
         )
         self._state_lock = Lock()
         self.active_job_id: int | None = None
+        from app.services.kubernetes_monitor import CachedClusterSampler
+        self.kubernetes_sampler = CachedClusterSampler()
 
     def post(self, path: str, payload: dict) -> dict:
         for attempt in range(5):
@@ -85,14 +87,21 @@ class WorkerClient:
                     details[key] = False
         except Exception as exc:
             details["docker_cli_error"] = type(exc).__name__
-        for command, key in ((["k3s", "kubectl", "get", "nodes", "--no-headers"], "k3s"),):
-            try:
-                proc = subprocess.run(command, capture_output=True, text=True, timeout=8)
-                details[key] = proc.returncode == 0
-                if key == "k3s":
-                    details["node_status"] = proc.stdout.strip()[-500:]
-            except Exception:
-                details[key] = False
+        try:
+            snapshot = self.kubernetes_sampler.sample()
+            details["kubernetes_monitoring"] = snapshot
+            details["k3s"] = snapshot.get("status") == "available"
+            details["node_status"] = ", ".join(
+                f"{node['name']}:{'Ready' if node.get('ready') else 'NotReady'}"
+                for node in snapshot.get("nodes", [])
+            )[:500]
+        except Exception as exc:
+            details["kubernetes_monitoring"] = {
+                "status": "unavailable", "sampled_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                "message": f"Kubernetes monitoring failed ({type(exc).__name__})", "alerts": [],
+                "deployments": [], "pods": [], "hpas": [],
+                "metrics": {"status": "unavailable", "message": "Kubernetes metrics are unavailable.", "pods": [], "nodes": []},
+            }
         return details
 
     def heartbeat(self) -> None:
@@ -132,21 +141,36 @@ def _execute(client: WorkerClient, job: dict) -> None:
     execution_succeeded = False
     try:
         if payload.get("operation") == "cleanup":
-            import re
             from app.services import kubernetes as k8s_svc
-
             namespace = str(payload.get("namespace") or "")
-            if not re.fullmatch(r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?", namespace):
-                raise ValueError("Invalid deployment namespace")
-            report("Deleting deployment namespace")
-            proc = k8s_svc._run(["kubectl", "delete", "namespace", namespace, "--wait=false", "--ignore-not-found=true"], timeout=60)
-            if proc.returncode:
-                raise RuntimeError((proc.stderr or proc.stdout or "Namespace cleanup failed")[-2000:])
+            if payload.get("project_id") is None or payload.get("source_deployment_id") is None:
+                raise ValueError("Cleanup job is missing its project or source deployment")
+            report("Removing deployment resources and preserving persistent volumes")
+            result = k8s_svc.cleanup_namespace_resources(namespace)
             execution_succeeded = True
             client.post(
                 f"/api/worker/jobs/{job_id}/complete",
-                {"status": "SUCCEEDED", "result": {"message": f"Namespace {namespace} cleanup requested", "namespace": namespace, "source_deployment_id": payload.get("source_deployment_id")}},
+                {"status": "SUCCEEDED", "result": {**result, "source_deployment_id": payload["source_deployment_id"]}},
             )
+            return
+
+        if payload.get("operation") in {"configure_autoscaling", "remove_autoscaling"}:
+            from app.services import kubernetes as k8s_svc
+            with use_deployment_target("remote"):
+                if payload["operation"] == "configure_autoscaling":
+                    report("Validating Metrics Server, resource requests, and autoscaling/v2")
+                    result = k8s_svc.apply_autoscaler(
+                        payload["namespace"], payload["deployment_name"], int(payload["source_deployment_id"]),
+                        payload["config"], payload.get("original_replicas"),
+                    )
+                else:
+                    report("Removing the CodeDeck-owned autoscaler and restoring the saved replica count")
+                    result = k8s_svc.remove_autoscaler(
+                        payload["namespace"], payload["deployment_name"], int(payload["source_deployment_id"]),
+                        payload.get("original_replicas"),
+                    )
+            execution_succeeded = True
+            client.post(f"/api/worker/jobs/{job_id}/complete", {"status": "SUCCEEDED", "result": result})
             return
 
         from app.agents.deployment_agent import deploy_staging

@@ -377,6 +377,169 @@ def get_service_port(service: str, namespace: str) -> int:
     return 80
 
 
+def cleanup_namespace_resources(namespace: str) -> dict:
+    """Delete namespaced app resources while retaining PVCs and namespace data."""
+    if not re.fullmatch(r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?", namespace):
+        raise ValueError("Invalid deployment namespace")
+    kinds = "horizontalpodautoscalers,deployments,services,ingresses,configmaps,secrets,networkpolicies,serviceaccounts,roles,rolebindings,resourcequotas,limitranges,jobs,cronjobs"
+    proc = _run(["kubectl", "delete", kinds, "--all", "-n", namespace, "--ignore-not-found=true", "--wait=true", "--timeout=60s"], timeout=75)
+    if proc.returncode:
+        raise RuntimeError((proc.stderr or proc.stdout or "Resource cleanup failed")[-2000:])
+    return {"namespace": namespace, "removed_kinds": kinds.split(","), "persistent_volume_claims_preserved": True, "message": (proc.stdout or "No owned resources remained").strip()[:1000]}
+
+
+def validate_autoscaling_config(config: dict) -> dict:
+    """Validate the deliberately small CPU/memory autoscaling contract."""
+    if not isinstance(config, dict):
+        raise ValueError("Autoscaling configuration must be an object")
+    minimum, maximum = config.get("min_replicas"), config.get("max_replicas")
+    cpu = config.get("target_cpu_utilization")
+    memory = config.get("target_memory_utilization")
+    def integer(value, field, low, high, optional=False):
+        if value is None and optional:
+            return None
+        if isinstance(value, bool) or not isinstance(value, int) or not low <= value <= high:
+            raise ValueError(f"{field} must be an integer between {low} and {high}")
+        return value
+    minimum = integer(minimum, "min_replicas", 1, 8)
+    maximum = integer(maximum, "max_replicas", 1, 8)
+    if minimum > maximum:
+        raise ValueError("min_replicas cannot exceed max_replicas")
+    cpu = integer(cpu, "target_cpu_utilization", 10, 95)
+    memory = integer(memory, "target_memory_utilization", 10, 95, optional=True)
+    behavior = config.get("behavior") or {}
+    if not isinstance(behavior, dict):
+        raise ValueError("behavior must be an object")
+    scale_up = integer(behavior.get("scale_up_stabilization_seconds", 0), "scale_up_stabilization_seconds", 0, 3600)
+    scale_down = integer(behavior.get("scale_down_stabilization_seconds", 300), "scale_down_stabilization_seconds", 0, 3600)
+    return {"min_replicas": minimum, "max_replicas": maximum, "target_cpu_utilization": cpu,
+            "target_memory_utilization": memory,
+            "behavior": {"scale_up_stabilization_seconds": scale_up, "scale_down_stabilization_seconds": scale_down}}
+
+
+def _autoscaling_client():
+    prepare_kubeconfig()
+    from app.services.kubernetes_monitor import _load_client
+    return _load_client()
+
+
+def apply_autoscaler(namespace: str, deployment_name: str, deployment_id: int, config: dict,
+                     previous_original_replicas: int | None = None) -> dict:
+    """Create/update one CodeDeck-owned HPA after checking metrics and pod requests."""
+    import re
+    from kubernetes.client.rest import ApiException
+
+    config = validate_autoscaling_config(config)
+    if not re.fullmatch(r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?", namespace) or not re.fullmatch(r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?", deployment_name):
+        raise ValueError("Invalid namespace or deployment name")
+    client = _autoscaling_client()
+    apps = client.AppsV1Api()
+    core = client.CoreV1Api()
+    autoscaling = client.AutoscalingV2Api()
+    custom = client.CustomObjectsApi()
+    try:
+        autoscaling.get_api_resources(_request_timeout=10)
+    except Exception as exc:
+        raise RuntimeError("Kubernetes autoscaling/v2 API is unavailable") from exc
+    try:
+        custom.list_namespaced_custom_object("metrics.k8s.io", "v1beta1", namespace, "pods", limit=1, _request_timeout=10)
+    except Exception as exc:
+        raise RuntimeError("Metrics Server is unavailable; CPU and memory HPA metrics cannot be read") from exc
+    workload = apps.read_namespaced_deployment(deployment_name, namespace, _request_timeout=10)
+    containers = (workload.spec.template.spec.containers or [])
+    if not containers:
+        raise ValueError("Target deployment has no application containers")
+    required = {"cpu"} | ({"memory"} if config["target_memory_utilization"] is not None else set())
+    missing = [container.name for container in containers
+               if not container.resources or not container.resources.requests
+               or not required.issubset(container.resources.requests.keys())]
+    if missing:
+        raise ValueError("Resource requests are required for CPU and selected memory targets on every container: " + ", ".join(missing))
+    try:
+        quota = core.read_namespaced_resource_quota("codedeck-budget", namespace, _request_timeout=10)
+        pod_limit = (quota.status.hard or {}).get("pods")
+        if pod_limit:
+            hard_limit = int(pod_limit)
+            selector = workload.spec.selector.match_labels or {}
+            if not selector:
+                raise ValueError("Cannot verify namespace pod quota because the target Deployment has no label selector")
+            all_pods = core.list_namespaced_pod(namespace, _request_timeout=10).items
+            other_pods = sum(1 for pod in all_pods if not all((pod.metadata.labels or {}).get(key) == value for key, value in selector.items())
+                             and getattr(pod.status, "phase", None) not in {"Succeeded", "Failed"})
+            if config["max_replicas"] + other_pods > hard_limit:
+                raise ValueError(f"max_replicas plus existing supporting pods exceeds this namespace's {hard_limit}-pod quota")
+    except ApiException as exc:
+        if exc.status != 404:
+            raise
+    hpa_name = f"codedeck-{deployment_id}-autoscaler"
+    existing = None
+    try:
+        existing = autoscaling.read_namespaced_horizontal_pod_autoscaler(hpa_name, namespace, _request_timeout=10)
+        labels = existing.metadata.labels or {}
+        if labels.get("app.kubernetes.io/managed-by") != "codedeck" or labels.get("codedeck.io/deployment-id") != str(deployment_id):
+            raise RuntimeError("An HPA with this name exists but is not owned by this deployment")
+        saved = (existing.metadata.annotations or {}).get("codedeck.io/original-replicas")
+        original = previous_original_replicas if previous_original_replicas is not None else int(saved) if saved and saved.isdigit() else (workload.spec.replicas or 1)
+    except ApiException as exc:
+        if exc.status != 404:
+            raise
+        original = workload.spec.replicas or 1
+    metrics = [{"type": "Resource", "resource": {"name": "cpu", "target": {"type": "Utilization", "averageUtilization": config["target_cpu_utilization"]}}}]
+    if config["target_memory_utilization"] is not None:
+        metrics.append({"type": "Resource", "resource": {"name": "memory", "target": {"type": "Utilization", "averageUtilization": config["target_memory_utilization"]}}})
+    behavior = config["behavior"]
+    manifest = {"apiVersion": "autoscaling/v2", "kind": "HorizontalPodAutoscaler",
+                "metadata": {"name": hpa_name, "namespace": namespace,
+                             "labels": {"app.kubernetes.io/managed-by": "codedeck", "codedeck.io/deployment-id": str(deployment_id)},
+                             "annotations": {"codedeck.io/original-replicas": str(original)}},
+                "spec": {"scaleTargetRef": {"apiVersion": "apps/v1", "kind": "Deployment", "name": deployment_name},
+                         "minReplicas": config["min_replicas"], "maxReplicas": config["max_replicas"], "metrics": metrics,
+                         "behavior": {"scaleUp": {"stabilizationWindowSeconds": behavior["scale_up_stabilization_seconds"],
+                                                    "selectPolicy": "Max", "policies": [{"type": "Pods", "value": 2, "periodSeconds": 60}]},
+                                      "scaleDown": {"stabilizationWindowSeconds": behavior["scale_down_stabilization_seconds"],
+                                                      "selectPolicy": "Min", "policies": [{"type": "Pods", "value": 1, "periodSeconds": 60}]}}}}
+    if existing:
+        autoscaling.patch_namespaced_horizontal_pod_autoscaler(hpa_name, namespace, manifest, _request_timeout=15)
+        operation = "updated"
+    else:
+        autoscaling.create_namespaced_horizontal_pod_autoscaler(namespace, manifest, _request_timeout=15)
+        operation = "created"
+    return {"name": hpa_name, "namespace": namespace, "deployment_name": deployment_name,
+            "operation": operation, "original_replicas": original, "config": config,
+            "message": f"Autoscaler {operation}; Kubernetes now owns replica count within the configured range."}
+
+
+def remove_autoscaler(namespace: str, deployment_name: str, deployment_id: int, original_replicas: int | None) -> dict:
+    """Delete only the identified CodeDeck HPA, then restore the saved manual replica count."""
+    import re
+    from kubernetes.client.rest import ApiException
+
+    if not re.fullmatch(r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?", namespace) or not re.fullmatch(r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?", deployment_name):
+        raise ValueError("Invalid namespace or deployment name")
+    client = _autoscaling_client()
+    autoscaling = client.AutoscalingV2Api()
+    apps = client.AppsV1Api()
+    hpa_name = f"codedeck-{deployment_id}-autoscaler"
+    try:
+        hpa = autoscaling.read_namespaced_horizontal_pod_autoscaler(hpa_name, namespace, _request_timeout=10)
+    except ApiException as exc:
+        if exc.status == 404:
+            if original_replicas is not None:
+                apps.patch_namespaced_deployment_scale(deployment_name, namespace, {"spec": {"replicas": original_replicas}}, _request_timeout=15)
+            return {"name": hpa_name, "namespace": namespace, "operation": "already-absent", "restored_replicas": original_replicas, "message": "Autoscaler was already absent; the saved replica count was restored." if original_replicas is not None else "Autoscaler was already absent."}
+        raise
+    labels = hpa.metadata.labels or {}
+    if labels.get("app.kubernetes.io/managed-by") != "codedeck" or labels.get("codedeck.io/deployment-id") != str(deployment_id):
+        raise RuntimeError("Refusing to remove an autoscaler not owned by this deployment")
+    annotation_replicas = (hpa.metadata.annotations or {}).get("codedeck.io/original-replicas")
+    restore = original_replicas if original_replicas is not None else int(annotation_replicas) if annotation_replicas and annotation_replicas.isdigit() else None
+    autoscaling.delete_namespaced_horizontal_pod_autoscaler(hpa_name, namespace, body=client.V1DeleteOptions(), _request_timeout=15)
+    if restore is not None:
+        apps.patch_namespaced_deployment_scale(deployment_name, namespace, {"spec": {"replicas": restore}}, _request_timeout=15)
+    return {"name": hpa_name, "namespace": namespace, "operation": "removed", "restored_replicas": restore,
+            "message": "Autoscaler removed; the recorded manual replica count was restored." if restore is not None else "Autoscaler removed; no saved manual replica count was available."}
+
+
 class PortForwardManager:
     def __init__(self):
         self._processes: dict[str, tuple[int, subprocess.Popen]] = {}

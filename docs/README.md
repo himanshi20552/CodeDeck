@@ -8,6 +8,20 @@ Welcome to the technical documentation for **CodeDeck**, an AI-assisted software
 
 | Document | Description |
 | :--- | :--- |
+| [`AWS_EC2_SETUP.md`](AWS_EC2_SETUP.md) | EC2 bootstrap, worker service, configuration, and health verification |
+| [`REMOTE_DEPLOYMENT_ARCHITECTURE.md`](REMOTE_DEPLOYMENT_ARCHITECTURE.md) | Control-plane/worker flow and implementation status |
+| [`K3S_DEPLOYMENT.md`](K3S_DEPLOYMENT.md) | Docker-to-containerd image transfer, rollout, ingress, and troubleshooting |
+| [`DEPLOYMENT_SECURITY.md`](DEPLOYMENT_SECURITY.md) | Worker credentials, namespace controls, and untrusted code limits |
+
+| Document | Description |
+| :--- | :--- |
+| [`AWS_EC2_SETUP.md`](AWS_EC2_SETUP.md) | EC2 bootstrap, worker service, configuration, and health verification |
+| [`REMOTE_DEPLOYMENT_ARCHITECTURE.md`](REMOTE_DEPLOYMENT_ARCHITECTURE.md) | Control-plane/worker flow and implementation status |
+| [`K3S_DEPLOYMENT.md`](K3S_DEPLOYMENT.md) | Docker-to-containerd image transfer, rollout, ingress, and troubleshooting |
+| [`DEPLOYMENT_SECURITY.md`](DEPLOYMENT_SECURITY.md) | Worker credentials, namespace controls, and untrusted code limits |
+
+| Document | Description |
+| :--- | :--- |
 | [`ARCHITECTURE.md`](file:///d:/agent/docs/ARCHITECTURE.md) | High-level system architecture, component breakdown, LangGraph workflow, DB schemas, security model |
 | [`TECHNOLOGY_GUIDE.md`](file:///d:/agent/docs/TECHNOLOGY_GUIDE.md) | Comprehensive technology guide covering all 30+ stack components for developers |
 | [`AI_PIPELINE.md`](file:///d:/agent/docs/AI_PIPELINE.md) | Detailed breakdown of repository RAG, hash embeddings, Q&A, AI testing, and failure analysis |

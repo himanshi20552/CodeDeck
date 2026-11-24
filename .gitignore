@@ -32,6 +32,7 @@ docs/*
 !docs/HYBRID_SEARCH.md
 !docs/LANGFUSE.md
 !docs/MONITORING.md
+!docs/kubernetes-autoscaling.md
 !docs/CI_CD.md
 !docs/RELIABILITY.md
 !docs/ARCHITECTURE.md
@@ -40,3 +41,4 @@ docs/*
 !docs/REMOTE_DEPLOYMENT_ARCHITECTURE.md
 !docs/K3S_DEPLOYMENT.md
 !docs/DEPLOYMENT_SECURITY.md
+!docs/release-approval-auth.md

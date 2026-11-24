@@ -10,7 +10,7 @@ from fastapi.responses import JSONResponse, Response
 from fastapi import Request
 from fastapi.exceptions import RequestValidationError
 
-from app.api import analysis, deployments, projects, system, worker
+from app.api import analysis, approvals, deployments, monitoring, projects, system, worker
 from app.core.config import settings
 from app.db.database import init_db
 from app.services.observability import (
@@ -19,6 +19,7 @@ from app.services.observability import (
     metrics_status,
     record_http_request,
 )
+from app.services.monitoring import monitoring_service
 
 logging.basicConfig(
     level=logging.INFO,
@@ -41,7 +42,14 @@ async def lifespan(_: FastAPI):
         prepare_kubeconfig()
     except Exception:
         logger.warning("kubeconfig not prepared yet (kind may be missing)")
-    yield
+    try:
+        monitoring_service.start()
+    except Exception as exc:
+        logger.warning("Monitoring service could not start (%s)", type(exc).__name__)
+    try:
+        yield
+    finally:
+        monitoring_service.stop()
 
 
 app = FastAPI(title="CodeDeck", version="1.0.0", lifespan=lifespan)
@@ -61,8 +69,10 @@ app.add_middleware(
 app.include_router(projects.router)
 app.include_router(analysis.router)
 app.include_router(deployments.router)
+app.include_router(approvals.router)
 app.include_router(system.router)
 app.include_router(worker.router)
+app.include_router(monitoring.router)
 
 
 @app.exception_handler(RequestValidationError)

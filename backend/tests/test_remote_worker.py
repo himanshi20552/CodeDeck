@@ -240,6 +240,7 @@ def test_stale_worker_heartbeat_fails_and_releases_active_job(monkeypatch):
             return deployment if model is Deployment else project
 
     monkeypatch.setattr(worker_api, "upsert_step", lambda *args, **kwargs: None)
+    monkeypatch.setattr("app.services.release_approvals.finish_staging_tracking", lambda *args, **kwargs: None)
     worker_api._fail_stale_worker_job(FakeDB(), heartbeat)
     assert deployment.status == "FAILED"
     assert "worker_payload" not in deployment.details

@@ -29,6 +29,7 @@ class Settings(BaseSettings):
     local_kind_enabled: bool = False
     remote_worker_url: str = ""
     remote_worker_token: str = ""
+    release_approval_token: str = ""
     worker_id: str = "codedeck-worker"
     worker_poll_interval: int = Field(default=5, ge=1, le=60)
     worker_heartbeat_interval: int = Field(default=15, ge=5, le=300)
@@ -47,6 +48,14 @@ class Settings(BaseSettings):
     semantic_min_similarity: float = Field(default=0.35, ge=0, le=1)
     llm_timeout_seconds: int = Field(default=45, ge=1, le=600)
     repository_clone_timeout: int = Field(default=300, ge=10, le=1800)
+    monitoring_enabled: bool = True
+    monitoring_workspace_root: str = ""
+    monitoring_exclude_patterns: str = ""
+    monitoring_event_debounce_seconds: float = Field(default=0.75, ge=0.05, le=10)
+    monitoring_kubernetes_interval_seconds: int = Field(default=30, ge=10, le=600)
+    monitoring_restart_alert_threshold: int = Field(default=3, ge=1, le=100)
+    monitoring_cpu_alert_millicores: int = Field(default=1500, ge=100, le=100000)
+    monitoring_memory_alert_bytes: int = Field(default=1610612736, ge=104857600, le=1099511627776)
 
 
 settings = Settings()
